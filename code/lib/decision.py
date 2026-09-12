@@ -31,6 +31,7 @@ Strict monetary precision:
 from __future__ import annotations
 
 import itertools
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, timedelta
 from decimal import Decimal
@@ -45,6 +46,7 @@ from .simulation import (
     compute_amount_safe_to_pay,
     evaluate_schedule_safety,
     find_earliest_date_for_full_payment,
+    get_recurring_stream_identifier,
 )
 
 
@@ -120,6 +122,8 @@ class AtomicSpendingChange:
     event_id: str
     new_amount: Optional[Decimal]
     change_str: str
+    stream_id: str = ""
+    matched_event_ids: Optional[frozenset[str]] = None
 
 
 def find_eligible_spending_changes(
@@ -139,28 +143,37 @@ def find_eligible_spending_changes(
                and flexibility in ('stoppable', 'reducible_or_stoppable')
              - reduce_to:<event_id>:<new_amount> requires category in expense_categories_user_is_willing_to_reduce
                and flexibility in ('reducible', 'reducible_or_stoppable') and minimum_allowed_amount is not None
-      - Represents each action at the event / recurring-stream level.
+      - Groups candidates by stream identity (using get_recurring_stream_identifier),
+        allowing multiple distinct streams sharing a category to be discovered and managed independently.
       - The event_id referenced is the representative/latest settled event of that flexible recurring stream.
     """
     protected = profile.expense_categories_to_protect or frozenset()
     willing_stop = profile.expense_categories_user_is_willing_to_stop or frozenset()
     willing_reduce = profile.expense_categories_user_is_willing_to_reduce or frozenset()
 
-    # Find flexible recurring debit events
-    category_events: Dict[str, List[ReconciledEvent]] = {}
-    for ev in ledger.all_events:
+    # Find flexible recurring debit events and group by stream identity
+    eligible_events = [
+        ev for ev in ledger.all_events
         if (
             ev.direction == "debit"
             and ev.is_recurring
             and ev.flexibility in ("reducible", "stoppable", "reducible_or_stoppable")
-        ):
-            if ev.category not in protected:
-                category_events.setdefault(ev.category, []).append(ev)
+            and ev.category not in protected
+        )
+    ]
+
+    stream_events: Dict[str, List[ReconciledEvent]] = defaultdict(list)
+    for ev in eligible_events:
+        cat_evs = [e for e in eligible_events if e.category == ev.category]
+        stream_id = get_recurring_stream_identifier(ev, cat_evs)
+        stream_events[stream_id].append(ev)
 
     candidates: List[AtomicSpendingChange] = []
-    for cat, ev_list in sorted(category_events.items()):
+    for stream_id, ev_list in sorted(stream_events.items()):
+        cat = ev_list[0].category
         # Select the most recent representative event for this recurring stream
-        latest_ev = max(ev_list, key=lambda x: (x.settlement_date, x.event_date, x.event_id))
+        latest_ev = max(ev_list, key=lambda x: (x.settlement_date or x.event_date, x.event_id))
+        matched_ids = frozenset(e.event_id for e in ev_list)
 
         # Check stoppable
         if cat in willing_stop and latest_ev.flexibility in ("stoppable", "reducible_or_stoppable"):
@@ -170,6 +183,8 @@ def find_eligible_spending_changes(
                 event_id=latest_ev.event_id,
                 new_amount=None,
                 change_str=f"stop:{latest_ev.event_id}",
+                stream_id=stream_id,
+                matched_event_ids=matched_ids,
             ))
 
         # Check reducible
@@ -185,6 +200,8 @@ def find_eligible_spending_changes(
                 event_id=latest_ev.event_id,
                 new_amount=clean_amt,
                 change_str=f"reduce_to:{latest_ev.event_id}:{clean_amt}",
+                stream_id=stream_id,
+                matched_event_ids=matched_ids,
             ))
 
     return candidates
@@ -198,15 +215,15 @@ def generate_spending_change_combinations(
 
     Constraints:
       - At most 3 changes.
-      - Never both stop and reduce on the same event or category.
+      - Never both stop and reduce on the same event or stream.
       - Deterministic ordering.
     """
     valid_subsets: List[Tuple[AtomicSpendingChange, ...]] = []
     for k in range(1, min(max_changes, len(atomic_changes)) + 1):
         for combo in itertools.combinations(atomic_changes, k):
-            # Check for conflicting categories (cannot both stop and reduce same category)
-            categories = [c.category for c in combo]
-            if len(categories) == len(set(categories)):
+            # Check for conflicting streams (cannot both stop and reduce same stream)
+            stream_keys = [c.stream_id or c.event_id for c in combo]
+            if len(stream_keys) == len(set(stream_keys)):
                 valid_subsets.append(combo)
 
     return valid_subsets
@@ -220,6 +237,7 @@ def to_stream_spending_changes(combo: Sequence[AtomicSpendingChange]) -> List[St
             target_event_id=c.event_id,
             category=c.category,
             new_amount=c.new_amount,
+            matched_event_ids=c.matched_event_ids,
         )
         for c in combo
     ]

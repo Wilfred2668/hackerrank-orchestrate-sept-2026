@@ -25,7 +25,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import date, timedelta
 from decimal import Decimal, ROUND_FLOOR
-from typing import AbstractSet, Dict, List, Optional, Sequence, Set, Tuple
+from typing import AbstractSet, Dict, List, Literal, Optional, Sequence, Set, Tuple
 
 from .models import FinancialProfile, Request
 from .reconciliation import ReconciledEvent, ReconciledLedger
@@ -82,11 +82,48 @@ class StreamSpendingChange:
         target_event_id: The representative event_id of the flexible recurring stream.
         category: The category of the recurring stream.
         new_amount: The reduced amount if action == 'reduce_to', else None.
+        matched_event_ids: Optional frozenset of event_ids in this stream lineage.
     """
     action: Literal["stop", "reduce_to"]
     target_event_id: str
     category: str
     new_amount: Optional[Decimal] = None
+    matched_event_ids: Optional[frozenset[str]] = None
+
+
+def get_recurring_stream_identifier(
+    event: ReconciledEvent,
+    category_events: Optional[Sequence[ReconciledEvent]] = None,
+) -> str:
+    """Return an unambiguous recurring-stream identity string.
+
+    Distinguishes distinct recurring streams sharing a category based on category,
+    direction, and normalized description or lineage link.
+    """
+    cat = (event.category or "").strip().lower()
+    direction = (event.direction or "").strip().lower()
+    desc = (event.description or "").strip().lower()
+
+    if event.linked_event_id:
+        return f"{cat}::{direction}::link::{event.linked_event_id}"
+
+    generic_descs = {"", cat, f"test {cat}", f"projected recurring {cat}"}
+
+    if category_events:
+        specific_descs = {
+            (e.description or "").strip().lower()
+            for e in category_events
+            if (e.description or "").strip().lower() not in generic_descs
+        }
+        if len(specific_descs) <= 1:
+            canonical_desc = next(iter(specific_descs)) if specific_descs else "default"
+            return f"{cat}::{direction}::{canonical_desc}"
+
+    if desc and desc not in generic_descs:
+        return f"{cat}::{direction}::{desc}"
+    if desc:
+        return f"{cat}::{direction}::default"
+    return f"{cat}::{direction}::id::{event.event_id}"
 
 
 # ---------------------------------------------------------------------------
@@ -177,22 +214,30 @@ def generate_future_recurring_occurrences(
     start_date = request_date
     end_date = request_date + timedelta(days=forecast_days)
 
-    streams: Dict[Tuple[str, str], List[ReconciledEvent]] = defaultdict(list)
+    cat_dir_events: Dict[Tuple[str, str], List[ReconciledEvent]] = defaultdict(list)
     for e in ledger.recurring_events:
-        streams[(e.category, e.direction)].append(e)
+        cat_dir_events[(e.category, e.direction)].append(e)
+
+    streams: Dict[str, List[ReconciledEvent]] = defaultdict(list)
+    for (cat, direction), ev_list in cat_dir_events.items():
+        for e in ev_list:
+            s_id = get_recurring_stream_identifier(e, ev_list)
+            streams[s_id].append(e)
 
     projected_events: List[ReconciledEvent] = []
 
-    for (cat, direction), stream_events in streams.items():
+    for stream_id, stream_events in sorted(streams.items()):
         # Phase 3 reconciliation already manages recurring salary synthesis
-        if cat == "salary" and direction == "credit":
+        if stream_events[0].category == "salary" and stream_events[0].direction == "credit":
             continue
 
+        cat = stream_events[0].category
+        direction = stream_events[0].direction
         cadence_day = get_recurring_cadence_day(stream_events)
         conservative_amt = get_conservative_recurring_amount(stream_events)
 
-        # Inherit metadata from the latest event in the stream
-        latest_event = max(stream_events, key=lambda x: x.event_date)
+        # Inherit metadata from the anchor/latest event in the stream
+        latest_event = max(stream_events, key=lambda x: (x.settlement_date or x.event_date, x.event_id))
 
         # Generate occurrences through forecast window
         cur_year = start_date.year
@@ -206,10 +251,15 @@ def generate_future_recurring_occurrences(
             if start_date <= cand_date <= end_date:
                 # De-duplication check:
                 # Does ledger.all_events already contain a scheduled/settled occurrence
-                # for (cat, direction) in this cadence cycle on or after request_date?
+                # for this specific recurring stream in this cadence cycle on or after request_date?
                 already_exists = any(
                     e.category == cat
                     and e.direction == direction
+                    and (
+                        e.linked_event_id == latest_event.event_id
+                        or get_recurring_stream_identifier(e, ledger.all_events) == stream_id
+                        or stream_id.endswith("::default")
+                    )
                     and (e.settlement_date or e.event_date) >= start_date
                     and (
                         (e.settlement_date or e.event_date) == cand_date
@@ -224,10 +274,10 @@ def generate_future_recurring_occurrences(
 
                 if not already_exists:
                     proj_ev = ReconciledEvent(
-                        event_id=f"proj_{cat}_{cand_date.isoformat()}",
+                        event_id=f"proj_{latest_event.event_id}_{cand_date.isoformat()}",
                         user_id=ledger.user_id,
                         event_type=latest_event.event_type,
-                        description=f"Projected recurring {cat}",
+                        description=latest_event.description or f"Projected recurring {cat}",
                         category=cat,
                         direction=direction,
                         original_amount=conservative_amt,
@@ -476,14 +526,14 @@ def simulate_cash_flow(
         is_stopped = False
         reduced_cap: Optional[Decimal] = None
 
-        # Targeted stream spending changes: applies strictly to flexible recurring debits
+        # Targeted stream spending changes: applies strictly to flexible recurring debits matching anchor lineage
         if stream_spending_changes and event.direction == "debit":
             if event.is_recurring and event.flexibility in ("reducible", "stoppable", "reducible_or_stoppable"):
                 for sc in stream_spending_changes:
                     if (
                         event.event_id == sc.target_event_id
                         or event.linked_event_id == sc.target_event_id
-                        or event.category == sc.category
+                        or (sc.matched_event_ids is not None and event.event_id in sc.matched_event_ids)
                     ):
                         if sc.action == "stop":
                             is_stopped = True

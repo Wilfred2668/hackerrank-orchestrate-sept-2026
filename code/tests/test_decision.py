@@ -759,32 +759,48 @@ def test_no_candidate_produces_invalid_combinations(
 # ---------------------------------------------------------------------------
 
 def test_stream_scoping_affects_only_flexible_recurring_stream():
-    """Regression test for Requirement 1:
-      - One eligible flexible recurring event.
+    """Regression test for Stream Scoping:
+      - Build two flexible recurring debits in the same category but from different streams.
       - A same-category fixed debit and a same-category one-time debit.
-    Prove that the spending action affects only the eligible recurring stream,
-    leaving both the same-category one-time debit and same-category fixed debit in effect.
+    Stop one stream and prove:
+      - its historical/future linked occurrences change;
+      - the other stream’s current and projected occurrences remain unchanged;
+      - no one-time or fixed record changes.
     """
-    start_balance = Decimal("3000.00")
-    min_balance = Decimal("1000.00")
+    start_balance = Decimal("10000.00")
+    min_balance = Decimal("2000.00")
     req_date = date(2026, 5, 1)
 
     events = [
-        # Event A: Eligible flexible recurring streaming debit
+        # Stream 1: Flexible recurring Video streaming plan ($20 monthly)
         _build_test_event(
-            event_id="ev_rec_stream",
+            event_id="ev_stream_A_curr",
             event_date=date(2026, 5, 5),
             settlement_date=date(2026, 5, 5),
             direction="debit",
-            amount=Decimal("50.00"),
+            amount=Decimal("20.00"),
             category="streaming",
             flexibility="stoppable",
             is_recurring=True,
             is_protected=False,
             is_stoppable=True,
-            description="Monthly streaming subscription",
+            description="Video streaming plan",
         ),
-        # Event B: Same-category one-time debit (discretionary gift card/equipment)
+        # Stream 2: Flexible recurring Audio streaming plan ($10 monthly) in same category
+        _build_test_event(
+            event_id="ev_stream_B_curr",
+            event_date=date(2026, 5, 8),
+            settlement_date=date(2026, 5, 8),
+            direction="debit",
+            amount=Decimal("10.00"),
+            category="streaming",
+            flexibility="stoppable",
+            is_recurring=True,
+            is_protected=False,
+            is_stoppable=True,
+            description="Audio streaming plan",
+        ),
+        # Same-category one-time debit (discretionary equipment)
         _build_test_event(
             event_id="ev_onetime_stream",
             event_date=date(2026, 5, 10),
@@ -798,7 +814,7 @@ def test_stream_scoping_affects_only_flexible_recurring_stream():
             is_stoppable=True,
             description="One-time streaming equipment purchase",
         ),
-        # Event C: Same-category fixed recurring debit (contractual multi-year service)
+        # Same-category fixed recurring debit (contractual service)
         _build_test_event(
             event_id="ev_fixed_stream",
             event_date=date(2026, 5, 12),
@@ -818,33 +834,54 @@ def test_stream_scoping_affects_only_flexible_recurring_stream():
         minimum_balance_to_keep=min_balance,
         events=events,
     )
+    profile = _build_test_profile(
+        current_available_balance=start_balance,
+        minimum_balance_to_keep=min_balance,
+        expense_categories_user_is_willing_to_stop=frozenset({"streaming"}),
+    )
 
-    # 1. Simulate with stream_spending_changes stopping ev_rec_stream
-    sc = StreamSpendingChange(
+    # 1. Discovery verifies both distinct streams are found as independent spending change candidates
+    changes = find_eligible_spending_changes(profile, ledger)
+    change_strs = [c.change_str for c in changes]
+    assert "stop:ev_stream_A_curr" in change_strs
+    assert "stop:ev_stream_B_curr" in change_strs
+
+    # 2. Simulate stopping only Stream A (Video streaming plan) with recurrence forecasting enabled
+    sc_A = StreamSpendingChange(
         action="stop",
-        target_event_id="ev_rec_stream",
+        target_event_id="ev_stream_A_curr",
         category="streaming",
+        matched_event_ids=frozenset({"ev_stream_A_curr"}),
     )
     sim = simulate_cash_flow(
         ledger=ledger,
         request_date=req_date,
-        stream_spending_changes=[sc],
-        forecast_days=30,
-        include_projected_recurring=False,
+        stream_spending_changes=[sc_A],
+        forecast_days=60,
+        include_projected_recurring=True,
         include_projected_essentials=False,
     )
 
-    # Day 5 (date of ev_rec_stream): 50.00 debit is STOPPED -> Balance remains 3000.00
-    assert sim.daily_balances[date(2026, 5, 5)] == Decimal("3000.00")
-    assert sim.daily_balances[date(2026, 5, 6)] == Decimal("3000.00")
+    # Day 5 (Stream A current): $20 is STOPPED -> Balance remains 10000.00
+    assert sim.daily_balances[date(2026, 5, 5)] == Decimal("10000.00")
+    assert sim.daily_balances[date(2026, 5, 6)] == Decimal("10000.00")
 
-    # Day 10 (date of ev_onetime_stream): 300.00 one-time debit MUST NOT be stopped!
-    # Balance drops by 300.00 to 2700.00
-    assert sim.daily_balances[date(2026, 5, 10)] == Decimal("2700.00")
+    # Day 8 (Stream B current): $10 debit is NOT stopped -> Balance drops by $10 to 9990.00
+    assert sim.daily_balances[date(2026, 5, 8)] == Decimal("9990.00")
+    assert sim.daily_balances[date(2026, 5, 9)] == Decimal("9990.00")
 
-    # Day 12 (date of ev_fixed_stream): 150.00 fixed debit MUST NOT be stopped!
-    # Balance drops by 150.00 to 2550.00
-    assert sim.daily_balances[date(2026, 5, 12)] == Decimal("2550.00")
+    # Day 10 (One-time debit): $300 debit MUST NOT be stopped -> Balance drops by $300 to 9690.00
+    assert sim.daily_balances[date(2026, 5, 10)] == Decimal("9690.00")
+
+    # Day 12 (Fixed recurring debit): $150 fixed debit MUST NOT be stopped -> Balance drops by $150 to 9540.00
+    assert sim.daily_balances[date(2026, 5, 12)] == Decimal("9540.00")
+
+    # June 5 (Stream A projected occurrence): $20 projected debit is STOPPED -> Balance stays 9540.00
+    assert sim.daily_balances[date(2026, 6, 5)] == Decimal("9540.00")
+    assert sim.daily_balances[date(2026, 6, 6)] == Decimal("9540.00")
+
+    # June 8 (Stream B projected occurrence): $10 projected debit is NOT stopped -> Balance drops to 9530.00
+    assert sim.daily_balances[date(2026, 6, 8)] == Decimal("9530.00")
 
 
 # ---------------------------------------------------------------------------

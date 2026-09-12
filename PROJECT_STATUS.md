@@ -97,16 +97,21 @@ challenge tie-break order. Final output writing and validation remain Phase 6.
 
 ## Phase 5 correction — 2026-09-12
 
+## Phase 5 stream-scoping correction — 2026-09-12
+
 Corrected and verified across all unit tests (86 passing):
-1. `find_eligible_spending_changes` enforces `is_recurring=True`, `direction="debit"`,
-   `flexibility in ("reducible", "stoppable", "reducible_or_stoppable")`, outside protected
-   categories, and matching user stop/reduce preferences.
-2. `StreamSpendingChange` scopes spending directives to the target recurring event / stream,
-   ensuring unrelated one-time and fixed debits in the same category are unaffected.
-3. Partial-payment candidates with permitted spending changes are generated, preserving the
-   baseline `amount_safe_to_pay` and exact two-payment structure, emitting `affordable_with_plan`.
-4. Independent `earliest_date_for_full_payment` is preserved in fallback if safe within the
-   90-day horizon, even when no plan completes by `desired_completion_date`.
-5. Candidate ranking key strictly implements the 6 required criteria (deadline completion,
-   no spending changes, lowest total cost, earlier first payment, fewer payments, lowest option ID).
+1. Removed the `event.category == target_category` fallback from `simulate_cash_flow`.
+   A spending change now strictly matches:
+   - `event.event_id == sc.target_event_id` (anchor occurrence),
+   - `event.linked_event_id == sc.target_event_id` (lineage/projected occurrences), or
+   - `(sc.matched_event_ids is not None and event.event_id in sc.matched_event_ids)` (explicit lineage events).
+2. Defined `get_recurring_stream_identifier(event, category_events)` to provide unambiguous
+   stream identity based on lineage links or distinct provider/service descriptions, cleanly
+   separating concurrent flexible streams sharing a category while clustering single-stream events.
+3. Updated `find_eligible_spending_changes` to group candidates by distinct recurring stream identity.
+4. Added regression test `test_stream_scoping_affects_only_flexible_recurring_stream` verifying two
+   concurrent flexible recurring streams in the same category (e.g. Video streaming vs Audio streaming):
+   stopping one affects only its current and projected occurrences, leaves the other stream's current
+   and projected occurrences intact, and does not alter same-category one-time or fixed debits.
+
 
