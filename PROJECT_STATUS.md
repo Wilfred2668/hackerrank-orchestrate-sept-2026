@@ -31,10 +31,19 @@ categories, and never invent financial facts.
   fixed-recurring forecasts, and protected variable-essential forecasts.
 - [x] Phase 5 — Decision construction corrected: stream-scoped spending changes,
   partial-payment spending changes, preserved fallback earliest date, and exact
-  6-key ranking order.
+  6-key ranking order (`4b6b154`, statically approved on 2026-09-12).
 - [ ] Phase 6 — Output verification.
 - [ ] Phase 7 — Full run, sample scoring, and usage report.
 - [ ] Phase 8 — Package and submit.
+
+## Phase 6 dispatch — 2026-09-12
+
+Implement a fail-closed output validator and serializer for existing
+`DecisionResult` values. It must check the challenge output contract,
+cross-validate the recommended plan and spending changes against their source
+records, and serialize only validated rows in the exact required column order.
+Do not run the full dataset, write the final root `output.csv`, alter Phase 5
+decision logic, or begin sample scoring in this phase.
 
 ## Phase 5 scope
 
@@ -99,7 +108,19 @@ challenge tie-break order. Final output writing and validation remain Phase 6.
 
 ## Phase 5 stream-scoping correction — 2026-09-12
 
+Static approval: reviewed commit `4b6b154de1c1c762f2229acd699ba46a92095e3a`
+without executing project code. Spending-change application is strictly anchored
+by event or explicit lineage, so it no longer alters every event sharing a
+category. The recurrence stream key separates simultaneous provider/plan
+descriptions and propagates the selected anchor to generated future occurrences.
+The accompanying regression correctly keeps the second flexible stream plus
+same-category one-time and fixed debits intact. The reported 86-test result is
+recorded as implementer-provided evidence, not locally re-executed evidence.
+
 Corrected and verified across all unit tests (86 passing):
+1. Removed the `event.category == target_category` fallback from `simulate_cash_flow`.
+   A spending change now strictly matches:
+   - `event.event_id == sc.target_event_id` (anchor occurrence),
 1. Removed the `event.category == target_category` fallback from `simulate_cash_flow`.
    A spending change now strictly matches:
    - `event.event_id == sc.target_event_id` (anchor occurrence),
@@ -114,4 +135,16 @@ Corrected and verified across all unit tests (86 passing):
    stopping one affects only its current and projected occurrences, leaves the other stream's current
    and projected occurrences intact, and does not alter same-category one-time or fixed debits.
 
+## Phase 6 implementation — 2026-09-12
 
+Implemented fail-closed output validation and deterministic serialization in `code/lib/validation.py` and test suite `code/tests/test_validation.py`:
+1. `validate_decision_result`:
+   - Enforces exact output contract schema (8 columns in exact specification order).
+   - Validates Decimal bounds (`0 <= amount_safe_to_pay <= requested_amount`).
+   - Validates status, method, and payment-plan coherence across all 5 payment methods.
+   - Enforces stream-scoped spending change legality (debit, flexible, recurring, non-protected, permitted by user preferences, minimum allowed amount bounds, and non-conflicting stream identities).
+   - Independently re-checks financial safety via Phase 4 simulation (`evaluate_schedule_safety`), rejecting any schedule that breaches `minimum_balance_to_keep`.
+2. Deterministic serialization:
+   - `serialize_decision_row`, `serialize_decision_csv_line`, and `serialize_decisions_to_csv` format exact 8 columns without float conversion. Does not write root `output.csv`.
+3. Added comprehensive test suite in `code/tests/test_validation.py` (21 tests covering valid outcomes, bounds, malformed plans, status/method mismatches, invalid spending changes, stream conflicts, simulation safety rejections, and exact serialization).
+   - Per explicit instructions, tests remain unexecuted in this task.
