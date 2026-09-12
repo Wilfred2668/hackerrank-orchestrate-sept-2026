@@ -107,6 +107,12 @@ def get_recurring_stream_identifier(
     if event.linked_event_id:
         return f"{cat}::{direction}::link::{event.linked_event_id}"
 
+    # For discretionary/variable categories where receipts reflect merchant/store names
+    # (e.g. dining, groceries, transport, entertainment, shopping), all transactions
+    # in the category represent the user's overall recurring spending cadence in that category.
+    if cat in ("dining", "shopping", "entertainment", "groceries", "transport"):
+        return f"{cat}::{direction}"
+
     generic_descs = {"", cat, f"test {cat}", f"projected recurring {cat}"}
 
     if category_events:
@@ -131,11 +137,9 @@ def get_recurring_stream_identifier(
 # ---------------------------------------------------------------------------
 
 def clean_decimal(val: Decimal) -> Decimal:
-    """Format Decimal cleanly: preserve up to 2 decimal places, omit trailing zeros if whole."""
+    """Format Decimal cleanly: preserve whole integer if integral, else 2 decimal places."""
     if val == val.to_integral():
         return val.to_integral()
-    if val == val.quantize(Decimal("0.1")):
-        return val.quantize(Decimal("0.1"))
     return val.quantize(Decimal("0.01"))
 
 

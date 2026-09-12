@@ -723,8 +723,10 @@ def generate_decision_explanation(
             rem_amt = request.requested_amount - amount_safe_to_pay
             rem_amt_str = f"{curr} {_format_money(rem_amt)}"
             date_str = _format_date(earliest_date_for_full_payment) if earliest_date_for_full_payment else "a later date"
+            changes_desc = _describe_spending_changes(spending_changes_needed, ledger, curr)
+            prefix = f"{changes_desc}, then pay" if changes_desc else "Pay"
             return (
-                f"Pay {first_amt_str} today and the remaining {rem_amt_str} on {date_str}. "
+                f"{prefix} {first_amt_str} today and the remaining {rem_amt_str} on {date_str}. "
                 f"This completes the full request and keeps the {min_bal_str} minimum protected."
             )
 

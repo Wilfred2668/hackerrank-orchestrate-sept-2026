@@ -130,6 +130,9 @@ def is_recurring_event(event: FinancialEvent, user_events: List[FinancialEvent])
     if event.event_type in ("subscription", "debt_payment"):
         return True
     if event.category == "rent":
+        desc = event.description.lower()
+        if any(k in desc for k in ("outstanding", "arrear", "deposit", "balance", "one-time")):
+            return False
         return True
     if event.category == "salary":
         desc = event.description.lower()
@@ -590,9 +593,15 @@ def reconcile_user_ledger(
                     valid_cash_events = updated
 
                 elif match_res.category == "rent":
+                    img_event_ids = {x["event_id"] for x in image_extractions}
                     updated = []
                     for ev in valid_cash_events:
-                        if ev.category == "rent" and ev.status == "scheduled":
+                        if (
+                            ev.category == "rent"
+                            and ev.status == "scheduled"
+                            and ev.event_id not in img_event_ids
+                            and not any(k in ev.description.lower() for k in ("outstanding", "arrear", "deposit", "balance"))
+                        ):
                             if eff_d is None or ev.event_date >= eff_d:
                                 # Update ONLY amount; preserve individual event_date and settlement_date
                                 ev = FinancialEvent(
@@ -669,6 +678,16 @@ def reconcile_user_ledger(
     # Step 4: Synthesize Confirmed Recurring Salary Stream
     # Ensures salary amendments and active recurring salaries are concrete cash events on the ledger
     if not salary_cancelled and request_date is not None:
+        all_sal_credits = [
+            e for e in valid_cash_events
+            if e.category == "salary" and e.direction == "credit"
+        ]
+        if all_sal_credits:
+            latest_sal = max(all_sal_credits, key=lambda x: x.event_date)
+            if any(k in latest_sal.description.lower() for k in ("final", "terminated", "severance")):
+                salary_cancelled = True
+
+    if not salary_cancelled and request_date is not None:
         # Determine baseline active salary amount
         active_salary_amount: Optional[Decimal] = recurring_salary_amount
         if active_salary_amount is None:
@@ -684,7 +703,7 @@ def reconcile_user_ledger(
                 settled_sal = [
                     e for e in valid_cash_events
                     if e.category == "salary" and e.direction == "credit" and e.status == "settled"
-                    and not any(k in e.description.lower() for k in ("arrear", "bonus", "one-time", "adjustment"))
+                    and not any(k in e.description.lower() for k in ("arrear", "bonus", "commission", "one-time", "adjustment", "final"))
                 ]
                 if settled_sal:
                     active_salary_amount = max(settled_sal, key=lambda x: x.event_date).amount
@@ -695,7 +714,11 @@ def reconcile_user_ledger(
             if next_salary_date is not None:
                 payday = next_salary_date.day
             else:
-                existing_sal = [e for e in valid_cash_events if e.category == "salary" and e.direction == "credit"]
+                existing_sal = [
+                    e for e in valid_cash_events
+                    if e.category == "salary" and e.direction == "credit"
+                    and not any(k in e.description.lower() for k in ("arrear", "bonus", "commission", "one-time", "adjustment", "final"))
+                ]
                 if existing_sal:
                     payday = max(existing_sal, key=lambda x: x.event_date).event_date.day
                 else:

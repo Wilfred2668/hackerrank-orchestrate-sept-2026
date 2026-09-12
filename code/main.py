@@ -25,6 +25,7 @@ import json
 import os
 import sys
 import time
+from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -36,7 +37,11 @@ if str(_CODE_DIR) not in sys.path:
     sys.path.insert(0, str(_CODE_DIR))
 
 from lib.decision import DecisionResult, evaluate_decision
-from lib.extraction import extract_image_amount, extract_messages_batched
+from lib.extraction import (
+    extract_image_amount,
+    extract_messages_batched,
+    validate_extraction_data,
+)
 from lib.loaders import DataStore, dataset_dir
 from lib.models import Request
 from lib.reconciliation import ReconciledLedger, reconcile_user_ledger
@@ -51,11 +56,37 @@ from lib.validation import (
 )
 
 
-def load_or_produce_extractions(ds: DataStore, repo_root: Path) -> Dict[str, Any]:
+@dataclass
+class RunTelemetry:
+    log_position_start: int = 0
+    aggregate_file_reused: bool = False
+    image_cache_hits: int = 0
+    image_cache_misses: int = 0
+    image_api_calls: int = 0
+    image_failed_calls: int = 0
+    image_new_cache_entries: int = 0
+    message_cache_hits: int = 0
+    message_cache_misses: int = 0
+    message_api_calls: int = 0
+    message_failed_calls: int = 0
+    message_new_cache_entries: int = 0
+    new_calls_in_run: int = 0
+    calls_made_in_run: List[Dict[str, Any]] = field(default_factory=list)
+
+
+def load_or_produce_extractions(
+    ds: DataStore,
+    repo_root: Path,
+    telemetry: Optional[RunTelemetry] = None,
+) -> Dict[str, Any]:
     """Load or produce image and message extraction evidence using cache-aware layer.
 
     Fails closed if any extraction fails or is missing; never invents facts.
+    Atomically writes rebuilt extraction data after validation.
     """
+    if telemetry is None:
+        telemetry = RunTelemetry()
+
     data_dir = repo_root / "code" / "data"
     extracted_file = data_dir / "extracted_deltas.json"
     ds_dir = str(repo_root / "dataset")
@@ -64,28 +95,52 @@ def load_or_produce_extractions(ds: DataStore, repo_root: Path) -> Dict[str, Any
         try:
             with open(extracted_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            imgs = data.get("image_extractions", [])
-            msgs = data.get("message_deltas", [])
-            if len(imgs) == 16 and len(msgs) >= 215:
-                return data
+            validate_extraction_data(data, ds)
+            telemetry.aggregate_file_reused = True
+            return data
         except Exception as e:
-            print(f"[Warning] Failed loading existing extracted_deltas.json: {e}. Rebuilding...")
+            print(f"[Warning] Failed loading or validating existing extracted_deltas.json: {e}. Rebuilding...")
 
+    telemetry.aggregate_file_reused = False
     data_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. Image Extractions
+    from lib import llm_client
+
     blank_events = [e for e in ds.events if e.amount is None]
     image_results: List[Dict[str, Any]] = []
     for event in blank_events:
         image = ds.get_image_for_event(event.event_id)
         if image is None:
             raise RuntimeError(f"Missing required image for blank-amount event {event.event_id}")
-        res = extract_image_amount(event, image, ds_dir)
-        if not res or res.get("extracted_amount") is None:
-            raise RuntimeError(f"Failed extraction for event {event.event_id} from image {image.image_id}")
-        image_results.append(res)
+
+        cached = llm_client.get_cached("image_extraction", event.event_id)
+        if cached is not None:
+            telemetry.image_cache_hits += 1
+        else:
+            telemetry.image_cache_misses += 1
+            telemetry.image_api_calls += 1
+
+        try:
+            res = extract_image_amount(event, image, ds_dir)
+            if not res or res.get("extracted_amount") is None:
+                telemetry.image_failed_calls += 1
+                raise RuntimeError(f"Failed extraction for event {event.event_id} from image {image.image_id}")
+            if cached is None:
+                telemetry.image_new_cache_entries += 1
+            image_results.append(res)
+        except Exception:
+            telemetry.image_failed_calls += 1
+            raise
 
     # 2. Message Extractions
+    for msg in ds.messages:
+        cached = llm_client.get_cached("message_extraction", msg.message_id)
+        if cached is not None:
+            telemetry.message_cache_hits += 1
+        else:
+            telemetry.message_cache_misses += 1
+
     message_results = extract_messages_batched(ds.messages, ds, batch_size=15)
     if len(message_results) < len(ds.messages):
         raise RuntimeError(
@@ -96,8 +151,15 @@ def load_or_produce_extractions(ds: DataStore, repo_root: Path) -> Dict[str, Any
         "image_extractions": image_results,
         "message_deltas": message_results,
     }
-    with open(extracted_file, "w", encoding="utf-8") as f:
+
+    # Validate rebuilt extraction data before persisting
+    validate_extraction_data(output, ds)
+
+    # Atomic write to disk
+    temp_file = extracted_file.with_suffix(".json.tmp")
+    with open(temp_file, "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2, ensure_ascii=False)
+    os.replace(temp_file, extracted_file)
 
     return output
 
@@ -257,8 +319,12 @@ def run_full_pipeline(
     repo_root: Path,
     output_csv_path: Path,
     report_md_path: Path,
+    telemetry: Optional[RunTelemetry] = None,
 ) -> List[ValidatedDecision]:
     """Run full production pipeline across all 250 requests with atomic CSV replacement."""
+    if telemetry is None:
+        telemetry = RunTelemetry()
+
     requests = ds.requests
     total_requests = len(requests)
     print(f"\n========================================================")
@@ -266,7 +332,6 @@ def run_full_pipeline(
     print(f"========================================================")
 
     log_path = repo_root / "code" / "logs" / "llm_calls.jsonl"
-    calls_before = len(parse_llm_call_log(log_path))
 
     start_time = time.time()
     validated_decisions: List[ValidatedDecision] = []
@@ -346,15 +411,22 @@ def run_full_pipeline(
     # -----------------------------------------------------------------------
     # Step 6: Usage report generation
     # -----------------------------------------------------------------------
-    calls_after = len(parse_llm_call_log(log_path))
-    new_calls = calls_after - calls_before
+    all_calls_after = parse_llm_call_log(log_path)
+    new_calls = max(0, len(all_calls_after) - telemetry.log_position_start)
+    telemetry.new_calls_in_run = new_calls
+    telemetry.calls_made_in_run = all_calls_after[telemetry.log_position_start:]
 
     generate_usage_report_markdown(
         log_path=log_path,
         output_path=report_md_path,
         evaluation_requests_count=total_requests,
-        new_calls_in_run=new_calls,
-        cached_calls_reused=231,
+        new_calls_in_run=telemetry.new_calls_in_run,
+        aggregate_file_reused=telemetry.aggregate_file_reused,
+        image_cache_hits=telemetry.image_cache_hits,
+        image_cache_misses=telemetry.image_cache_misses,
+        message_cache_hits=telemetry.message_cache_hits,
+        message_cache_misses=telemetry.message_cache_misses,
+        calls_made_in_run=telemetry.calls_made_in_run,
     )
     print(f"[SUCCESS] Generated evidence-based usage report at {report_md_path}.")
 
@@ -390,8 +462,12 @@ def main() -> None:
     args = parser.parse_args()
 
     print(f"Buy or Wait? — Phase 7 Execution starting in mode '{args.mode}'...")
+    log_path = _REPO_ROOT / "code" / "logs" / "llm_calls.jsonl"
+    all_calls_init = parse_llm_call_log(log_path)
+    telemetry = RunTelemetry(log_position_start=len(all_calls_init))
+
     ds = DataStore()
-    extracted_data = load_or_produce_extractions(ds, _REPO_ROOT)
+    extracted_data = load_or_produce_extractions(ds, _REPO_ROOT, telemetry)
 
     if args.mode in ("sample", "all"):
         run_sample_evaluation(ds, extracted_data, _REPO_ROOT)
@@ -399,7 +475,7 @@ def main() -> None:
     if args.mode in ("full", "all"):
         out_csv = Path(args.output).resolve()
         rep_md = Path(args.report).resolve()
-        run_full_pipeline(ds, extracted_data, _REPO_ROOT, out_csv, rep_md)
+        run_full_pipeline(ds, extracted_data, _REPO_ROOT, out_csv, rep_md, telemetry)
 
 
 if __name__ == "__main__":

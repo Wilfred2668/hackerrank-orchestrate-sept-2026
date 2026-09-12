@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import re
 from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import llm_client
 from .loaders import DataStore, dataset_dir
@@ -517,21 +517,32 @@ def extract_messages_batched(
             # Fallback if array parsing or count didn't match:
             print("-> Warning: batch parse mismatch, falling back to per-message extraction for this batch...", flush=True)
             for m in chunk:
-                res = extract_message_delta(m, ds)
-                results[m.message_id] = res
+                try:
+                    res = extract_message_delta(m, ds)
+                    results[m.message_id] = res
+                except Exception as ind_ex:
+                    raise RuntimeError(f"Individual fallback extraction failed for message {m.message_id}: {ind_ex}") from ind_ex
 
         except Exception as ex:
             print(f"-> Batch failed ({ex}), falling back to individual calls...", flush=True)
+            failed_mids: List[Tuple[str, str]] = []
             for m in chunk:
                 try:
                     res = extract_message_delta(m, ds)
                     results[m.message_id] = res
                 except Exception as inner_ex:
-                    results[m.message_id] = [{
-                        "message_id": m.message_id,
-                        "action": "confirm_no_change",
-                        "reasoning": f"Extraction failed: {inner_ex}",
-                    }]
+                    failed_mids.append((m.message_id, str(inner_ex)))
+
+            if failed_mids:
+                raise RuntimeError(
+                    f"Message extraction failed closed for {len(failed_mids)} messages: {failed_mids}. "
+                    "Failed extractions must never be converted to confirm_no_change."
+                )
+
+    # Verify all messages were successfully extracted
+    missing_mids = [m.message_id for m in messages if not results.get(m.message_id)]
+    if missing_mids:
+        raise RuntimeError(f"Message extraction incomplete; missing results for {len(missing_mids)} messages: {missing_mids}")
 
     # Flatten the deltas list in message order
     flat_results: List[Dict[str, Any]] = []
@@ -634,4 +645,124 @@ def _parse_json_or_array_response(raw: str) -> Any:
             pass
 
     return {"error": "Failed to parse JSON", "raw": raw[:500]}
+
+
+# ---------------------------------------------------------------------------
+# Validation of extraction data
+# ---------------------------------------------------------------------------
+
+ALLOWED_ACTIONS = {"confirm_no_change", "amend", "cancel", "delay", "new_fact"}
+
+
+def validate_extraction_data(data: Dict[str, Any], ds: DataStore) -> None:
+    """Validate cached or aggregate extraction data before use.
+
+    Enforces:
+    - exactly the expected blank-amount event/image IDs;
+    - every one of the 215 message IDs represented by at least one valid delta;
+    - no unknown message IDs;
+    - only supported actions and required fields;
+    - no extraction-failure placeholders;
+    - duplicate deltas allowed only when they are valid multi-clause results.
+    """
+    if not isinstance(data, dict):
+        raise ValueError(f"Extraction data must be a dict, got {type(data)}")
+
+    # 1. Validate Image Extractions
+    blank_events = [e for e in ds.events if e.amount is None]
+    expected_event_ids = {e.event_id for e in blank_events}
+    image_extractions = data.get("image_extractions")
+    if not isinstance(image_extractions, list):
+        raise ValueError(f"'image_extractions' must be a list, got {type(image_extractions)}")
+
+    extracted_event_ids = set()
+    for idx, img in enumerate(image_extractions):
+        if not isinstance(img, dict):
+            raise ValueError(f"Image extraction {idx} is not a dict: {img}")
+        ev_id = img.get("event_id")
+        if not ev_id:
+            raise ValueError(f"Image extraction {idx} missing event_id: {img}")
+        if ev_id not in expected_event_ids:
+            raise ValueError(f"Image extraction {idx} has unknown/unexpected event_id: {ev_id}")
+
+        extracted_amount = img.get("extracted_amount")
+        if extracted_amount is None:
+            raise ValueError(f"Image extraction for {ev_id} missing extracted_amount")
+        try:
+            val = Decimal(str(extracted_amount))
+            if val <= 0:
+                raise ValueError(f"Image extraction for {ev_id} has non-positive amount: {val}")
+        except (InvalidOperation, ValueError) as ex:
+            raise ValueError(f"Image extraction for {ev_id} has invalid amount '{extracted_amount}': {ex}")
+
+        # Check for failure placeholders
+        for fld in ("reasoning", "confidence"):
+            val_str = str(img.get(fld, "")).lower()
+            if "extraction failed" in val_str or "failed to parse" in val_str:
+                raise ValueError(f"Image extraction for {ev_id} contains failure placeholder in {fld}: {val_str}")
+
+        extracted_event_ids.add(ev_id)
+
+    if extracted_event_ids != expected_event_ids:
+        missing = expected_event_ids - extracted_event_ids
+        surplus = extracted_event_ids - expected_event_ids
+        raise ValueError(f"Image extractions mismatch: missing={sorted(missing)}, surplus={sorted(surplus)}")
+
+    # 2. Validate Message Deltas
+    expected_mids = {m.message_id for m in ds.messages}
+    message_deltas = data.get("message_deltas")
+    if not isinstance(message_deltas, list):
+        raise ValueError(f"'message_deltas' must be a list, got {type(message_deltas)}")
+
+    seen_deltas_by_mid: Dict[str, List[Dict[str, Any]]] = {}
+    for idx, delta in enumerate(message_deltas):
+        if not isinstance(delta, dict):
+            raise ValueError(f"Message delta {idx} is not a dict: {delta}")
+        mid = delta.get("message_id")
+        if not mid:
+            raise ValueError(f"Message delta {idx} missing message_id: {delta}")
+        if mid not in expected_mids:
+            raise ValueError(f"Message delta {idx} has unknown message_id: {mid}")
+
+        action = delta.get("action")
+        if action not in ALLOWED_ACTIONS:
+            raise ValueError(f"Message delta {idx} for {mid} has unsupported action: '{action}'")
+
+        reasoning = str(delta.get("reasoning", "")).lower()
+        if "extraction failed" in reasoning or "failed to parse" in reasoning:
+            raise ValueError(f"Message delta {idx} for {mid} contains extraction-failure placeholder: '{delta.get('reasoning')}'")
+
+        # Required fields per action
+        if action == "confirm_no_change":
+            if not str(delta.get("reasoning", "")).strip():
+                raise ValueError(f"Message delta {idx} for {mid} (confirm_no_change) missing reasoning")
+        elif action in ("amend", "cancel", "delay", "new_fact"):
+            if not delta.get("target"):
+                raise ValueError(f"Message delta {idx} for {mid} ({action}) missing target")
+            if action == "amend":
+                if delta.get("new_value") is None and delta.get("effective_date") is None:
+                    raise ValueError(f"Message delta {idx} for {mid} (amend) missing amended new_value or effective_date")
+
+        seen_deltas_by_mid.setdefault(mid, []).append(delta)
+
+    extracted_mids = set(seen_deltas_by_mid.keys())
+    if extracted_mids != expected_mids:
+        missing = expected_mids - extracted_mids
+        raise ValueError(f"Message extraction missing {len(missing)} message IDs: {sorted(missing)}")
+
+    # Check multi-clause validity
+    for mid, deltas in seen_deltas_by_mid.items():
+        if len(deltas) > 1:
+            signatures = [
+                (
+                    d.get("action"),
+                    d.get("target"),
+                    d.get("field"),
+                    str(d.get("new_value")),
+                    str(d.get("effective_date")),
+                )
+                for d in deltas
+            ]
+            if len(signatures) != len(set(signatures)):
+                raise ValueError(f"Message {mid} contains duplicate identical delta clauses")
 
