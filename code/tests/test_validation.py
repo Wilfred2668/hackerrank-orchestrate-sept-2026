@@ -528,7 +528,7 @@ def test_raw_decision_result_cannot_be_serialized():
 
 
 def test_validated_decision_cannot_be_instantiated_directly():
-    """ValidatedDecision cannot be instantiated directly to bypass validation."""
+    """ValidatedDecision cannot be instantiated through any public constructor route."""
     raw_decision = DecisionResult(
         request_id="req_001",
         amount_safe_to_pay=Decimal("1000.00"),
@@ -540,8 +540,80 @@ def test_validated_decision_cannot_be_instantiated_directly():
         decision_explanation="Raw decision.",
     )
 
+    # 1. Normal constructor call raises OutputValidationError
     with pytest.raises(OutputValidationError, match="cannot be instantiated directly"):
-        ValidatedDecision(decision=raw_decision)
+        ValidatedDecision(raw_decision)
+
+    # 2. Constructor call with _validated=True also raises OutputValidationError
+    with pytest.raises(OutputValidationError, match="cannot be instantiated directly"):
+        ValidatedDecision(raw_decision, _validated=True)  # type: ignore[call-arg]
+
+    # 3. Direct __new__ call also raises OutputValidationError
+    with pytest.raises(OutputValidationError, match="cannot be instantiated directly"):
+        ValidatedDecision.__new__(ValidatedDecision)
+
+
+def test_invalid_raw_decision_cannot_be_wrapped_or_serialized():
+    """An invalid raw decision cannot be wrapped through any public constructor route and cannot be serialized."""
+    raw_invalid = DecisionResult(
+        request_id="req_invalid",
+        amount_safe_to_pay=Decimal("-500.00"),  # invalid negative amount
+        affordability_status="affordable_now",
+        recommended_payment_method="full_payment",
+        payment_plan="2026-05-01:1000",
+        earliest_date_for_full_payment=date(2026, 5, 1),
+        spending_changes_needed="none",
+        decision_explanation="Invalid raw.",
+    )
+
+    # Cannot wrap via public constructor
+    with pytest.raises(OutputValidationError):
+        ValidatedDecision(raw_invalid)
+
+    with pytest.raises(OutputValidationError):
+        ValidatedDecision(raw_invalid, _validated=True)  # type: ignore[call-arg]
+
+    # Cannot pass raw decision to serializers
+    with pytest.raises(TypeError, match="Public serializer requires a ValidatedDecision"):
+        serialize_decision_row(raw_invalid)  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError, match="Public serializer requires a ValidatedDecision"):
+        serialize_decision_csv_line(raw_invalid)  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError, match="Public serializer requires ValidatedDecision"):
+        serialize_decisions_to_csv([raw_invalid])  # type: ignore[list-item]
+
+
+def test_validated_wrapper_serializes_normally():
+    """A wrapper returned by validate_decision_result serializes normally."""
+    req = _build_test_request(requested_amount=Decimal("1000.00"))
+    profile = _build_test_profile(current_available_balance=Decimal("5000.00"))
+    ledger = _build_test_ledger(current_available_balance=Decimal("5000.00"))
+
+    decision = DecisionResult(
+        request_id=req.request_id,
+        amount_safe_to_pay=Decimal("1000.00"),
+        affordability_status="affordable_now",
+        recommended_payment_method="full_payment",
+        payment_plan="2026-05-01:1000",
+        earliest_date_for_full_payment=date(2026, 5, 1),
+        spending_changes_needed="none",
+        decision_explanation="Full payment safe today.",
+    )
+
+    validated = validate_decision_result(req, profile, ledger, [], decision)
+    assert isinstance(validated, ValidatedDecision)
+
+    row = serialize_decision_row(validated)
+    assert len(row) == 8
+    assert row[0] == req.request_id
+    assert row[1] == "1000"
+
+    line = serialize_decision_csv_line(validated)
+    assert line.startswith("req_val_01,1000,affordable_now,full_payment")
+
+    csv_doc = serialize_decisions_to_csv([validated])
+    assert "req_val_01,1000,affordable_now" in csv_doc
 
 
 # ---------------------------------------------------------------------------

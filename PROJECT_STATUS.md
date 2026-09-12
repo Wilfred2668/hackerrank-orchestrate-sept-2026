@@ -180,3 +180,29 @@ Corrected all three static review blockers in `code/lib/validation.py` and `code
 
 The reported test count remains unexecuted implementer-provided evidence. Add
 targeted regression tests for each issue and retain the existing scope.
+
+## Phase 6 correction review — 2026-09-12 (`55c53a0`)
+
+Still not approved; one validation-gate bypass remains. Baseline recomputation
+and the exhaustive status/method matrix are correctly present. However,
+`ValidatedDecision` exposes `_validated` as a public constructor argument, so
+`ValidatedDecision(raw_invalid_decision, _validated=True)` succeeds and the
+public serializers accept it. The claimed direct-instantiation guard therefore
+does not guarantee that only validated rows are serialized. Replace the public
+boolean with an internal unforgeable factory path and add a regression test for
+the explicit boolean-bypass attempt.
+
+### Resolution:
+- Removed public boolean `_validated` parameter from `ValidatedDecision`.
+- Forbade direct public construction: `ValidatedDecision.__new__` and `__init__` unconditionally raise `OutputValidationError`, rejecting all public constructor invocations including `_validated=True`.
+- Replaced instantiation path with internal factory `ValidatedDecision._create_validated(decision)` called solely by `validate_decision_result` after all validation checks succeed.
+- Maintained immutability and property delegation on `ValidatedDecision`.
+- Preserved public serializer requirement (`isinstance(target, ValidatedDecision)`), ensuring raw decisions cannot be serialized.
+- Added regression tests in `code/tests/test_validation.py` verifying:
+  1. `ValidatedDecision(raw_decision)` raises `OutputValidationError`.
+  2. `ValidatedDecision(raw_decision, _validated=True)` raises `OutputValidationError`.
+  3. `ValidatedDecision.__new__(ValidatedDecision)` raises `OutputValidationError`.
+  4. An invalid raw decision cannot be wrapped via any public constructor route and cannot be serialized.
+  5. A wrapper returned by `validate_decision_result` still serializes normally across all serializer functions.
+- All tests remain unexecuted per project instructions.
+

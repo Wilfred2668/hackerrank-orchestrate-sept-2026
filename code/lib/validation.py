@@ -81,58 +81,82 @@ OUTPUT_COLUMNS: Tuple[str, ...] = (
 # Validated Decision Wrapper
 # ---------------------------------------------------------------------------
 
-@dataclass(frozen=True)
 class ValidatedDecision:
     """A decision result that has passed fail-closed validation against request, profile, and ledger.
-    Must be created via validate_decision_result; direct construction is disallowed.
+    Direct construction is forbidden through any public constructor route.
+    Instances can only be minted internally by validate_decision_result.
     """
-    decision: DecisionResult
-    _validated: bool = False
+    _decision: DecisionResult
 
-    def __post_init__(self) -> None:
-        if not self._validated:
-            raise OutputValidationError(
-                "ValidatedDecision cannot be instantiated directly; use validate_decision_result."
-            )
+    def __new__(cls, *args, **kwargs):
+        raise OutputValidationError(
+            "ValidatedDecision cannot be instantiated directly through public constructors. "
+            "Use validate_decision_result."
+        )
+
+    def __init__(self, *args, **kwargs) -> None:
+        raise OutputValidationError(
+            "ValidatedDecision cannot be instantiated directly through public constructors. "
+            "Use validate_decision_result."
+        )
+
+    @classmethod
+    def _create_validated(cls, decision: DecisionResult) -> ValidatedDecision:
+        """Internal factory invoked exclusively by validate_decision_result."""
+        instance = object.__new__(cls)
+        object.__setattr__(instance, "_decision", decision)
+        return instance
+
+    def __setattr__(self, key: str, value: object) -> None:
+        if hasattr(self, "_decision"):
+            raise AttributeError("ValidatedDecision is immutable.")
+        super().__setattr__(key, value)
+
+    @property
+    def decision(self) -> DecisionResult:
+        return self._decision
 
     @property
     def request_id(self) -> str:
-        return self.decision.request_id
+        return self._decision.request_id
 
     @property
     def amount_safe_to_pay(self) -> Decimal:
-        return self.decision.amount_safe_to_pay
+        return self._decision.amount_safe_to_pay
 
     @property
     def affordability_status(self) -> str:
-        return self.decision.affordability_status
+        return self._decision.affordability_status
 
     @property
     def recommended_payment_method(self) -> str:
-        return self.decision.recommended_payment_method
+        return self._decision.recommended_payment_method
 
     @property
     def payment_plan(self) -> str:
-        return self.decision.payment_plan
+        return self._decision.payment_plan
 
     @property
     def earliest_date_for_full_payment(self) -> Optional[date]:
-        return self.decision.earliest_date_for_full_payment
+        return self._decision.earliest_date_for_full_payment
 
     @property
     def spending_changes_needed(self) -> str:
-        return self.decision.spending_changes_needed
+        return self._decision.spending_changes_needed
 
     @property
     def decision_explanation(self) -> str:
-        return self.decision.decision_explanation
+        return self._decision.decision_explanation
 
     def __eq__(self, other: object) -> bool:
         if isinstance(other, ValidatedDecision):
-            return self.decision == other.decision
+            return self._decision == other._decision
         if isinstance(other, DecisionResult):
-            return self.decision == other
+            return self._decision == other
         return False
+
+    def __repr__(self) -> str:
+        return f"ValidatedDecision(decision={self._decision!r})"
 
 
 # ---------------------------------------------------------------------------
@@ -608,7 +632,7 @@ def validate_decision_result(
                 f"on {safety.first_unsafe_date}: {safety.unsafe_reason}."
             )
 
-    return ValidatedDecision(decision=decision, _validated=True)
+    return ValidatedDecision._create_validated(decision)
 
 
 # ---------------------------------------------------------------------------
