@@ -33,6 +33,7 @@ from lib.decision import (
 from lib.loaders import DataStore
 from lib.models import FinancialProfile, PaymentOption, Request
 from lib.reconciliation import ReconciledEvent, ReconciledLedger, reconcile_user_ledger
+from lib.simulation import StreamSpendingChange, evaluate_schedule_safety, simulate_cash_flow
 
 
 # ---------------------------------------------------------------------------
@@ -443,7 +444,7 @@ def test_spending_changes_restricted_to_allowed_flexible_events():
             flexibility="stoppable",
             is_protected=True,
         ),
-        # Streaming: stoppable, willing to stop, not protected -> ELIGIBLE FOR STOP
+        # Streaming: stoppable, willing to stop, not protected, is_recurring -> ELIGIBLE FOR STOP
         _build_test_event(
             event_id="ev_stream",
             event_date=date(2026, 4, 10),
@@ -452,10 +453,11 @@ def test_spending_changes_restricted_to_allowed_flexible_events():
             amount=Decimal("20.00"),
             category="streaming",
             flexibility="stoppable",
+            is_recurring=True,
             is_protected=False,
             is_stoppable=True,
         ),
-        # Entertainment: reducible, willing to reduce, min 15.00 -> ELIGIBLE FOR REDUCE
+        # Entertainment: reducible, willing to reduce, min 15.00, is_recurring -> ELIGIBLE FOR REDUCE
         _build_test_event(
             event_id="ev_ent",
             event_date=date(2026, 4, 15),
@@ -465,6 +467,7 @@ def test_spending_changes_restricted_to_allowed_flexible_events():
             category="entertainment",
             flexibility="reducible",
             minimum_allowed_amount=Decimal("15.00"),
+            is_recurring=True,
             is_protected=False,
             is_reducible=True,
         ),
@@ -478,8 +481,22 @@ def test_spending_changes_restricted_to_allowed_flexible_events():
             category="dining",
             flexibility="reducible",
             minimum_allowed_amount=Decimal("30.00"),
+            is_recurring=True,
             is_protected=False,
             is_reducible=True,
+        ),
+        # Streaming one-time purchase: stoppable, but NOT is_recurring -> NOT ELIGIBLE
+        _build_test_event(
+            event_id="ev_stream_onetime",
+            event_date=date(2026, 4, 25),
+            settlement_date=date(2026, 4, 25),
+            direction="debit",
+            amount=Decimal("45.00"),
+            category="streaming",
+            flexibility="stoppable",
+            is_recurring=False,
+            is_protected=False,
+            is_stoppable=True,
         ),
     ]
     ledger = _build_test_ledger(events=events)
@@ -493,6 +510,8 @@ def test_spending_changes_restricted_to_allowed_flexible_events():
     assert not any("rent" in s or "ev_rent" in s for s in change_strs)
     # Dining must not appear
     assert not any("dining" in s or "ev_dining" in s for s in change_strs)
+    # One-time streaming debit must not appear
+    assert not any("ev_stream_onetime" in s for s in change_strs)
 
     # Verify combinations generator respects max 3 and distinct categories
     combos = generate_spending_change_combinations(changes, max_changes=3)
@@ -728,5 +747,311 @@ def test_no_candidate_produces_invalid_combinations(
         elif dec.affordability_status == "not_affordable":
             assert dec.recommended_payment_method == "not_recommended"
             assert dec.payment_plan == "none"
-            assert dec.earliest_date_for_full_payment is None
+            # Per rule 3: earliest_date_for_full_payment is preserved if full payment becomes
+            # safe anywhere inside the 90-day horizon; None only if unsafe throughout the horizon.
+            if dec.earliest_date_for_full_payment is not None:
+                assert dec.earliest_date_for_full_payment >= sample.request_date
             assert dec.spending_changes_needed == "none"
+
+
+# ---------------------------------------------------------------------------
+# Test 9: Stream-Scoping Affects Only Flexible Recurring Stream (Regression)
+# ---------------------------------------------------------------------------
+
+def test_stream_scoping_affects_only_flexible_recurring_stream():
+    """Regression test for Requirement 1:
+      - One eligible flexible recurring event.
+      - A same-category fixed debit and a same-category one-time debit.
+    Prove that the spending action affects only the eligible recurring stream,
+    leaving both the same-category one-time debit and same-category fixed debit in effect.
+    """
+    start_balance = Decimal("3000.00")
+    min_balance = Decimal("1000.00")
+    req_date = date(2026, 5, 1)
+
+    events = [
+        # Event A: Eligible flexible recurring streaming debit
+        _build_test_event(
+            event_id="ev_rec_stream",
+            event_date=date(2026, 5, 5),
+            settlement_date=date(2026, 5, 5),
+            direction="debit",
+            amount=Decimal("50.00"),
+            category="streaming",
+            flexibility="stoppable",
+            is_recurring=True,
+            is_protected=False,
+            is_stoppable=True,
+            description="Monthly streaming subscription",
+        ),
+        # Event B: Same-category one-time debit (discretionary gift card/equipment)
+        _build_test_event(
+            event_id="ev_onetime_stream",
+            event_date=date(2026, 5, 10),
+            settlement_date=date(2026, 5, 10),
+            direction="debit",
+            amount=Decimal("300.00"),
+            category="streaming",
+            flexibility="stoppable",
+            is_recurring=False,  # ONE-TIME
+            is_protected=False,
+            is_stoppable=True,
+            description="One-time streaming equipment purchase",
+        ),
+        # Event C: Same-category fixed recurring debit (contractual multi-year service)
+        _build_test_event(
+            event_id="ev_fixed_stream",
+            event_date=date(2026, 5, 12),
+            settlement_date=date(2026, 5, 12),
+            direction="debit",
+            amount=Decimal("150.00"),
+            category="streaming",
+            flexibility="fixed",  # FIXED
+            is_recurring=True,
+            is_protected=False,
+            is_stoppable=False,
+            description="Fixed contract streaming connection",
+        ),
+    ]
+    ledger = _build_test_ledger(
+        current_available_balance=start_balance,
+        minimum_balance_to_keep=min_balance,
+        events=events,
+    )
+
+    # 1. Simulate with stream_spending_changes stopping ev_rec_stream
+    sc = StreamSpendingChange(
+        action="stop",
+        target_event_id="ev_rec_stream",
+        category="streaming",
+    )
+    sim = simulate_cash_flow(
+        ledger=ledger,
+        request_date=req_date,
+        stream_spending_changes=[sc],
+        forecast_days=30,
+        include_projected_recurring=False,
+        include_projected_essentials=False,
+    )
+
+    # Day 5 (date of ev_rec_stream): 50.00 debit is STOPPED -> Balance remains 3000.00
+    assert sim.daily_balances[date(2026, 5, 5)] == Decimal("3000.00")
+    assert sim.daily_balances[date(2026, 5, 6)] == Decimal("3000.00")
+
+    # Day 10 (date of ev_onetime_stream): 300.00 one-time debit MUST NOT be stopped!
+    # Balance drops by 300.00 to 2700.00
+    assert sim.daily_balances[date(2026, 5, 10)] == Decimal("2700.00")
+
+    # Day 12 (date of ev_fixed_stream): 150.00 fixed debit MUST NOT be stopped!
+    # Balance drops by 150.00 to 2550.00
+    assert sim.daily_balances[date(2026, 5, 12)] == Decimal("2550.00")
+
+
+# ---------------------------------------------------------------------------
+# Test 10: Partial-Payment Supported with Permitted Spending Changes
+# ---------------------------------------------------------------------------
+
+def test_partial_payment_with_spending_changes():
+    """Regression test for Requirement 2:
+      - Partial payment is unsafe without an allowed recurring spending change.
+      - Safe with the spending change.
+      - Preserves baseline amount_safe_to_pay.
+      - Retains exact two-payment formula summing to requested_amount.
+      - Emits affordable_with_plan.
+    """
+    req_date = date(2026, 5, 1)
+    req = _build_test_request(
+        request_date=req_date,
+        requested_amount=Decimal("2000.00"),
+        desired_completion_date=date(2026, 6, 1),
+        allows_partial_payment=True,
+    )
+    # Available balance 3000, min 2000 -> baseline safe today = 1000.00
+    # Headroom = 1000. Payment 1 on May 1 is 1000.00, leaving balance at exactly 2000.00.
+    # An upcoming recurring flexible streaming debit of 200 on May 10 would drop balance
+    # to 1800 (< 2000 min balance) -> Unsafe without spending changes!
+    # Salary arrives on May 15 (+2000), making second payment of 1000 safe on May 15.
+    events = [
+        _build_test_event(
+            event_id="ev_stream_sub",
+            event_date=date(2026, 5, 10),
+            settlement_date=date(2026, 5, 10),
+            direction="debit",
+            amount=Decimal("200.00"),
+            category="streaming",
+            flexibility="stoppable",
+            is_recurring=True,
+            is_protected=False,
+            is_stoppable=True,
+        ),
+        _build_test_event(
+            event_id="sal_may15",
+            event_date=date(2026, 5, 15),
+            settlement_date=date(2026, 5, 15),
+            direction="credit",
+            amount=Decimal("2000.00"),
+            category="salary",
+            status="scheduled",
+        ),
+    ]
+    profile = _build_test_profile(
+        current_available_balance=Decimal("3000.00"),
+        minimum_balance_to_keep=Decimal("2000.00"),
+        expense_categories_to_protect=frozenset({"rent"}),
+        expense_categories_user_is_willing_to_stop=frozenset({"streaming"}),
+        payment_methods_user_will_consider=frozenset({"partial_payment"}),
+    )
+    ledger = _build_test_ledger(
+        current_available_balance=Decimal("3000.00"),
+        minimum_balance_to_keep=Decimal("2000.00"),
+        events=events,
+    )
+
+    # Verify that partial payment without spending changes is UNSAFE:
+    # 1000 paid on May 1 leaves balance 2000; May 10 debit drops balance to 1800 (< 2000 min balance)
+    baseline_safe = Decimal("1000")
+    earliest_date = date(2026, 5, 15)
+    part_payments = ((req_date, baseline_safe), (earliest_date, req.requested_amount - baseline_safe))
+    safety_no_changes = evaluate_schedule_safety(
+        ledger=ledger,
+        request_date=req_date,
+        payments=part_payments,
+        minimum_balance_to_keep=Decimal("2000.00"),
+    )
+    assert not safety_no_changes.is_safe
+    assert safety_no_changes.first_unsafe_date == date(2026, 5, 10)
+
+    # Now evaluate candidate plans:
+    # Spending changes are evaluated and stop:ev_stream_sub makes partial payment safe!
+    candidates = build_candidate_plans(
+        request=req,
+        profile=profile,
+        ledger=ledger,
+        payment_options=[],
+        baseline_amount_safe=baseline_safe,
+        baseline_earliest_date=earliest_date,
+    )
+
+    assert len(candidates) == 1
+    cand = candidates[0]
+    assert cand.recommended_payment_method == "partial_payment"
+    assert cand.affordability_status == "affordable_with_plan"
+    assert cand.spending_changes == ("stop:ev_stream_sub",)
+    assert cand.is_safe is True
+    assert cand.total_paid == req.requested_amount
+
+    # Validate exact two-payment formula and sum
+    parts = cand.payment_plan_str.split("|")
+    assert len(parts) == 2
+    d1, a1 = parts[0].split(":")
+    d2, a2 = parts[1].split(":")
+    assert d1 == "2026-05-01"
+    assert Decimal(a1) == baseline_safe
+    assert d2 == "2026-05-15"
+    assert Decimal(a2) == req.requested_amount - baseline_safe
+    assert Decimal(a1) + Decimal(a2) == req.requested_amount
+
+
+# ---------------------------------------------------------------------------
+# Test 11: Preserved Earliest Full-Payment Date in Fallback
+# ---------------------------------------------------------------------------
+
+def test_not_affordable_preserves_earliest_full_payment_date():
+    """Regression test for Requirement 3:
+      - Full payment is safe after the desired deadline, but before day 90.
+      - No candidate completes by desired_completion_date.
+      - Result is not_affordable and not_recommended.
+      - earliest_date_for_full_payment is PRESERVED (not None).
+    """
+    req_date = date(2026, 5, 1)
+    req = _build_test_request(
+        request_date=req_date,
+        requested_amount=Decimal("2000.00"),
+        desired_completion_date=date(2026, 5, 10),  # Tight deadline: May 10
+        allows_partial_payment=False,
+    )
+    # Available 1000, min 500 -> headroom 500 (unsafe today for 2000).
+    # Salary arrives on May 25 (+3000). Full payment becomes safe on May 25.
+    # May 25 is within the 90-day horizon, but AFTER desired completion date (May 10).
+    events = [
+        _build_test_event(
+            event_id="sal_late",
+            event_date=date(2026, 5, 25),
+            settlement_date=date(2026, 5, 25),
+            direction="credit",
+            amount=Decimal("3000.00"),
+            category="salary",
+            status="scheduled",
+        )
+    ]
+    profile = _build_test_profile(
+        current_available_balance=Decimal("1000.00"),
+        minimum_balance_to_keep=Decimal("500.00"),
+        payment_methods_user_will_consider=frozenset({"full_payment"}),
+    )
+    ledger = _build_test_ledger(
+        current_available_balance=Decimal("1000.00"),
+        minimum_balance_to_keep=Decimal("500.00"),
+        events=events,
+    )
+
+    decision = evaluate_decision(req, profile, ledger, [])
+
+    assert decision.affordability_status == "not_affordable"
+    assert decision.recommended_payment_method == "not_recommended"
+    assert decision.payment_plan == "none"
+    # Preserved independent earliest full-payment date!
+    assert decision.earliest_date_for_full_payment == date(2026, 5, 25)
+    assert decision.spending_changes_needed == "none"
+
+
+# ---------------------------------------------------------------------------
+# Test 12: Lowest Cost Outranks Fewer Spending Changes
+# ---------------------------------------------------------------------------
+
+def test_ranking_lowest_cost_outranks_fewer_spending_changes():
+    """Regression test for Requirement 4:
+    Once both candidates require spending changes, lowest total cost outranks
+    the number of spending changes.
+    """
+    req = _build_test_request(
+        request_date=date(2026, 5, 1),
+        desired_completion_date=date(2026, 7, 1),
+    )
+
+    # Candidate A: 2 spending changes, but lower cost (1000.00)
+    plan_a_cheap_2_changes = CandidatePlan(
+        recommended_payment_method="installments",
+        affordability_status="affordable_with_plan",
+        payments=((date(2026, 5, 1), Decimal("500")),),
+        payment_plan_str="plan_a",
+        spending_changes=("stop:ev_1", "stop:ev_2"),
+        spending_changes_str="stop:ev_1|stop:ev_2",
+        completion_date=date(2026, 6, 1),
+        total_paid=Decimal("1000.00"),
+        first_payment_date=date(2026, 5, 1),
+        number_of_payments=2,
+        payment_option_id="opt_1",
+    )
+
+    # Candidate B: 1 spending change, but higher cost (1100.00)
+    plan_b_expensive_1_change = CandidatePlan(
+        recommended_payment_method="installments",
+        affordability_status="affordable_with_plan",
+        payments=((date(2026, 5, 1), Decimal("550")),),
+        payment_plan_str="plan_b",
+        spending_changes=("stop:ev_3",),
+        spending_changes_str="stop:ev_3",
+        completion_date=date(2026, 6, 1),
+        total_paid=Decimal("1100.00"),
+        first_payment_date=date(2026, 5, 1),
+        number_of_payments=2,
+        payment_option_id="opt_2",
+    )
+
+    key_a = candidate_ranking_key(plan_a_cheap_2_changes, req)
+    key_b = candidate_ranking_key(plan_b_expensive_1_change, req)
+
+    # Candidate A MUST rank ahead of Candidate B (< in sort order)
+    assert key_a < key_b
+

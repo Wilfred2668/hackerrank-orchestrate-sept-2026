@@ -73,6 +73,22 @@ class SafetyResult:
     unsafe_reason: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class StreamSpendingChange:
+    """A targeted spending change applied to a specific flexible recurring stream.
+
+    Attributes:
+        action: 'stop' (completely exclude stream) or 'reduce_to' (cap stream amount).
+        target_event_id: The representative event_id of the flexible recurring stream.
+        category: The category of the recurring stream.
+        new_amount: The reduced amount if action == 'reduce_to', else None.
+    """
+    action: Literal["stop", "reduce_to"]
+    target_event_id: str
+    category: str
+    new_amount: Optional[Decimal] = None
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -227,6 +243,7 @@ def generate_future_recurring_occurrences(
                         is_protected=latest_event.is_protected,
                         is_reducible=latest_event.is_reducible,
                         is_stoppable=latest_event.is_stoppable,
+                        linked_event_id=latest_event.event_id,
                     )
                     projected_events.append(proj_ev)
 
@@ -392,6 +409,7 @@ def simulate_cash_flow(
     include_projected_essentials: bool = True,
     stopped_categories: Optional[AbstractSet[str]] = None,
     reduced_categories: Optional[Dict[str, Decimal]] = None,
+    stream_spending_changes: Optional[Sequence[StreamSpendingChange]] = None,
 ) -> SimulationTimeline:
     """Run a deterministic daily cash-flow simulation over [request_date, request_date + forecast_days].
 
@@ -417,8 +435,9 @@ def simulate_cash_flow(
         forecast_days: Length of simulation window in days (default: 90).
         include_projected_recurring: If True, forecasts future recurring commitments.
         include_projected_essentials: If True, forecasts future protected variable essentials.
-        stopped_categories: Optional set of debit categories to completely exclude.
+        stopped_categories: Optional set of debit categories to exclude.
         reduced_categories: Optional dict mapping debit category to capped/reduced amount.
+        stream_spending_changes: Optional sequence of StreamSpendingChange targeting specific flexible recurring streams.
 
     Returns:
         SimulationTimeline with daily balances and minimum projected balance.
@@ -453,8 +472,32 @@ def simulate_cash_flow(
     for event in events_to_process:
         if excluded_event_ids and event.event_id in excluded_event_ids:
             continue
-        if stopped_categories and event.direction == "debit" and event.category in stopped_categories:
+
+        is_stopped = False
+        reduced_cap: Optional[Decimal] = None
+
+        # Targeted stream spending changes: applies strictly to flexible recurring debits
+        if stream_spending_changes and event.direction == "debit":
+            if event.is_recurring and event.flexibility in ("reducible", "stoppable", "reducible_or_stoppable"):
+                for sc in stream_spending_changes:
+                    if (
+                        event.event_id == sc.target_event_id
+                        or event.linked_event_id == sc.target_event_id
+                        or event.category == sc.category
+                    ):
+                        if sc.action == "stop":
+                            is_stopped = True
+                            break
+                        elif sc.action == "reduce_to" and sc.new_amount is not None:
+                            if reduced_cap is None or sc.new_amount < reduced_cap:
+                                reduced_cap = sc.new_amount
+
+        if is_stopped:
             continue
+
+        if stopped_categories and event.direction == "debit" and event.category in stopped_categories:
+            if event.is_recurring and event.flexibility in ("reducible", "stoppable", "reducible_or_stoppable"):
+                continue
 
         eff_date = event.settlement_date if event.settlement_date is not None else event.event_date
         # Only events within the forecast window apply during simulation
@@ -463,8 +506,11 @@ def simulate_cash_flow(
                 daily_net_flow[eff_date] += event.normalized_amount
             elif event.direction == "debit":
                 amt = event.normalized_amount
-                if reduced_categories and event.category in reduced_categories:
-                    amt = min(amt, reduced_categories[event.category])
+                if reduced_cap is not None:
+                    amt = min(amt, reduced_cap)
+                elif reduced_categories and event.category in reduced_categories:
+                    if event.is_recurring and event.flexibility in ("reducible", "stoppable", "reducible_or_stoppable"):
+                        amt = min(amt, reduced_categories[event.category])
                 daily_net_flow[eff_date] -= amt
 
     # Aggregate proposed payments
@@ -517,6 +563,7 @@ def evaluate_schedule_safety(
     include_projected_essentials: bool = True,
     stopped_categories: Optional[AbstractSet[str]] = None,
     reduced_categories: Optional[Dict[str, Decimal]] = None,
+    stream_spending_changes: Optional[Sequence[StreamSpendingChange]] = None,
 ) -> SafetyResult:
     """Determine whether a proposed payment schedule is safe.
 
@@ -537,6 +584,7 @@ def evaluate_schedule_safety(
         include_projected_essentials: If True, forecasts future protected variable essentials.
         stopped_categories: Optional set of debit categories to completely exclude.
         reduced_categories: Optional dict mapping debit category to capped/reduced amount.
+        stream_spending_changes: Optional sequence of StreamSpendingChange targeting specific flexible recurring streams.
 
     Returns:
         SafetyResult with is_safe, minimum_balance, and first_unsafe_date if unsafe.
@@ -576,6 +624,7 @@ def evaluate_schedule_safety(
         include_projected_essentials=include_projected_essentials,
         stopped_categories=stopped_categories,
         reduced_categories=reduced_categories,
+        stream_spending_changes=stream_spending_changes,
     )
 
     # Check for violations in chronological order

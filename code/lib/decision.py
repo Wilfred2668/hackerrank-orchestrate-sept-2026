@@ -10,7 +10,7 @@ Consumes:
   3. ReconciledLedger (current_available_balance, all_events, recurring_events, etc.)
   4. PaymentOption list (seller/provider options for this request)
   5. Phase 4 simulation APIs (compute_amount_safe_to_pay, find_earliest_date_for_full_payment,
-                              evaluate_schedule_safety, clean_decimal)
+                              evaluate_schedule_safety, clean_decimal, StreamSpendingChange)
 
 Produces:
   DecisionResult: typed result containing the 8 required fields:
@@ -40,6 +40,7 @@ from .models import FinancialProfile, PaymentOption, Request
 from .reconciliation import ReconciledEvent, ReconciledLedger
 from .simulation import (
     SafetyResult,
+    StreamSpendingChange,
     clean_decimal,
     compute_amount_safe_to_pay,
     evaluate_schedule_safety,
@@ -68,8 +69,7 @@ class CandidatePlan:
         number_of_payments: Total number of payments in the plan.
         payment_option_id: Optional ID of the seller payment option used (for tie-breaking).
         is_safe: True if plan passes schedule safety.
-        stopped_categories: Optional set of categories stopped for simulation.
-        reduced_categories: Optional dict of category -> reduced amount for simulation.
+        stream_spending_changes: Optional tuple of StreamSpendingChange applied during simulation.
     """
     recommended_payment_method: Literal[
         "full_payment", "partial_payment", "installments", "wait", "not_recommended"
@@ -87,8 +87,7 @@ class CandidatePlan:
     number_of_payments: int
     payment_option_id: Optional[str] = None
     is_safe: bool = True
-    stopped_categories: Optional[Tuple[str, ...]] = None
-    reduced_categories: Optional[Tuple[Tuple[str, Decimal], ...]] = None
+    stream_spending_changes: Optional[Tuple[StreamSpendingChange, ...]] = None
 
 
 @dataclass(frozen=True)
@@ -115,7 +114,7 @@ class DecisionResult:
 
 @dataclass(frozen=True)
 class AtomicSpendingChange:
-    """A single atomic spending change candidate."""
+    """A single atomic spending change candidate scoped to a flexible recurring stream."""
     action: Literal["stop", "reduce_to"]
     category: str
     event_id: str
@@ -130,28 +129,37 @@ def find_eligible_spending_changes(
     """Find all eligible atomic spending changes for a user.
 
     Rules:
-      - Target only flexible debit events in ledger.all_events.
-      - Never modify categories in profile.expense_categories_to_protect.
-      - stop:<event_id> requires category in profile.expense_categories_user_is_willing_to_stop
-        and event.flexibility in ('stoppable', 'reducible_or_stoppable').
-      - reduce_to:<event_id>:<new_amount> requires category in profile.expense_categories_user_is_willing_to_reduce
-        and event.flexibility in ('reducible', 'reducible_or_stoppable') and minimum_allowed_amount is not None.
-      - The event_id referenced is the representative/latest settled event of that flexible category.
+      - Considers ONLY events that are ALL of:
+          1. debit (direction == 'debit')
+          2. flexible (flexibility in ('reducible', 'stoppable', 'reducible_or_stoppable'))
+          3. is_recurring == True
+          4. outside protected categories (category not in expense_categories_to_protect)
+          5. allowed by relevant stop/reduce preference:
+             - stop:<event_id> requires category in expense_categories_user_is_willing_to_stop
+               and flexibility in ('stoppable', 'reducible_or_stoppable')
+             - reduce_to:<event_id>:<new_amount> requires category in expense_categories_user_is_willing_to_reduce
+               and flexibility in ('reducible', 'reducible_or_stoppable') and minimum_allowed_amount is not None
+      - Represents each action at the event / recurring-stream level.
+      - The event_id referenced is the representative/latest settled event of that flexible recurring stream.
     """
     protected = profile.expense_categories_to_protect or frozenset()
     willing_stop = profile.expense_categories_user_is_willing_to_stop or frozenset()
     willing_reduce = profile.expense_categories_user_is_willing_to_reduce or frozenset()
 
-    # Find flexible debit events
-    candidates: List[AtomicSpendingChange] = []
+    # Find flexible recurring debit events
     category_events: Dict[str, List[ReconciledEvent]] = {}
     for ev in ledger.all_events:
-        if ev.direction == "debit" and ev.flexibility in ("reducible", "stoppable", "reducible_or_stoppable"):
+        if (
+            ev.direction == "debit"
+            and ev.is_recurring
+            and ev.flexibility in ("reducible", "stoppable", "reducible_or_stoppable")
+        ):
             if ev.category not in protected:
                 category_events.setdefault(ev.category, []).append(ev)
 
+    candidates: List[AtomicSpendingChange] = []
     for cat, ev_list in sorted(category_events.items()):
-        # Select the most recent representative event for this category stream
+        # Select the most recent representative event for this recurring stream
         latest_ev = max(ev_list, key=lambda x: (x.settlement_date, x.event_date, x.event_id))
 
         # Check stoppable
@@ -191,7 +199,7 @@ def generate_spending_change_combinations(
     Constraints:
       - At most 3 changes.
       - Never both stop and reduce on the same event or category.
-      - Deterministic ordering by size and change string.
+      - Deterministic ordering.
     """
     valid_subsets: List[Tuple[AtomicSpendingChange, ...]] = []
     for k in range(1, min(max_changes, len(atomic_changes)) + 1):
@@ -202,6 +210,19 @@ def generate_spending_change_combinations(
                 valid_subsets.append(combo)
 
     return valid_subsets
+
+
+def to_stream_spending_changes(combo: Sequence[AtomicSpendingChange]) -> List[StreamSpendingChange]:
+    """Convert atomic spending changes into stream-scoped simulation directives."""
+    return [
+        StreamSpendingChange(
+            action=c.action,
+            target_event_id=c.event_id,
+            category=c.category,
+            new_amount=c.new_amount,
+        )
+        for c in combo
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +245,10 @@ def build_candidate_plans(
       2. Partial payment (without spending changes).
       3. Installments (from payment options, without spending changes).
       4. Wait (later full payment, without spending changes).
-      5. Spending-change candidates (when immediate/scheduled plans are unsafe).
+      5. Spending-change candidates:
+         - Full payment today with spending changes.
+         - Partial payment with spending changes.
+         - Installments with spending changes.
 
     Returns:
       List of safe CandidatePlan objects.
@@ -273,13 +297,16 @@ def build_candidate_plans(
     # -----------------------------------------------------------------------
     # Eligible only if request allows it, user considers it, 0 < amount_safe < requested,
     # and second payment on earliest_date completes by desired_completion_date.
-    if (
+    partial_payment_eligible = (
         request.allows_partial_payment
         and "partial_payment" in methods_considered
         and Decimal("0.00") < baseline_amount_safe < request.requested_amount
         and baseline_earliest_date is not None
         and baseline_earliest_date <= request.desired_completion_date
-    ):
+    )
+    partial_payment_unsafe_no_changes = False
+
+    if partial_payment_eligible:
         remainder = request.requested_amount - baseline_amount_safe
         part_payments = (
             (request.request_date, baseline_amount_safe),
@@ -312,6 +339,8 @@ def build_candidate_plans(
                 payment_option_id=None,
                 is_safe=True,
             ))
+        else:
+            partial_payment_unsafe_no_changes = True
 
     # -----------------------------------------------------------------------
     # 3. Installments (no spending changes)
@@ -401,9 +430,7 @@ def build_candidate_plans(
     # -----------------------------------------------------------------------
     # 5. Spending-Change Candidates
     # -----------------------------------------------------------------------
-    # Only consider spending changes when an otherwise desirable candidate is unsafe.
-    # We evaluate spending changes for full payment today, and for any installment options
-    # that failed simulation without changes.
+    # Evaluated for candidates that are unsafe without changes.
     atomic_changes = find_eligible_spending_changes(profile, ledger)
     if atomic_changes:
         change_combos = generate_spending_change_combinations(atomic_changes, max_changes=3)
@@ -412,9 +439,7 @@ def build_candidate_plans(
         if full_payment_eligible and full_payment_unsafe_today and (request.request_date <= request.desired_completion_date):
             fp_payments = ((request.request_date, request.requested_amount),)
             for combo in change_combos:
-                stopped_cats = {c.category for c in combo if c.action == "stop"}
-                reduced_cats = {c.category: c.new_amount for c in combo if c.action == "reduce_to" and c.new_amount is not None}
-
+                stream_changes = to_stream_spending_changes(combo)
                 safety = evaluate_schedule_safety(
                     ledger=ledger,
                     request_date=request.request_date,
@@ -422,8 +447,7 @@ def build_candidate_plans(
                     minimum_balance_to_keep=target_min,
                     protected_categories=protected,
                     forecast_days=forecast_days,
-                    stopped_categories=frozenset(stopped_cats) if stopped_cats else None,
-                    reduced_categories=reduced_cats if reduced_cats else None,
+                    stream_spending_changes=stream_changes,
                 )
                 if safety.is_safe:
                     change_strings = tuple(c.change_str for c in combo)
@@ -440,11 +464,50 @@ def build_candidate_plans(
                         number_of_payments=1,
                         payment_option_id=None,
                         is_safe=True,
-                        stopped_categories=tuple(stopped_cats) if stopped_cats else None,
-                        reduced_categories=tuple(reduced_cats.items()) if reduced_cats else None,
+                        stream_spending_changes=tuple(stream_changes),
                     ))
 
-        # Plan B: Installment options with spending changes (if user considers installments)
+        # Plan B: Partial payment with spending changes
+        if partial_payment_eligible and partial_payment_unsafe_no_changes:
+            remainder = request.requested_amount - baseline_amount_safe
+            part_payments = (
+                (request.request_date, baseline_amount_safe),
+                (baseline_earliest_date, remainder),
+            )
+            for combo in change_combos:
+                stream_changes = to_stream_spending_changes(combo)
+                safety = evaluate_schedule_safety(
+                    ledger=ledger,
+                    request_date=request.request_date,
+                    payments=part_payments,
+                    minimum_balance_to_keep=target_min,
+                    protected_categories=protected,
+                    forecast_days=forecast_days,
+                    stream_spending_changes=stream_changes,
+                )
+                if safety.is_safe:
+                    change_strings = tuple(c.change_str for c in combo)
+                    p_plan_str = (
+                        f"{request.request_date.isoformat()}:{clean_decimal(baseline_amount_safe)}|"
+                        f"{baseline_earliest_date.isoformat()}:{clean_decimal(remainder)}"
+                    )
+                    candidates.append(CandidatePlan(
+                        recommended_payment_method="partial_payment",
+                        affordability_status="affordable_with_plan",
+                        payments=part_payments,
+                        payment_plan_str=p_plan_str,
+                        spending_changes=change_strings,
+                        spending_changes_str="|".join(change_strings),
+                        completion_date=baseline_earliest_date,
+                        total_paid=request.requested_amount,
+                        first_payment_date=request.request_date,
+                        number_of_payments=2,
+                        payment_option_id=None,
+                        is_safe=True,
+                        stream_spending_changes=tuple(stream_changes),
+                    ))
+
+        # Plan C: Installment options with spending changes
         if "installments" in methods_considered and profile.max_installment_months is not None:
             for opt in payment_options:
                 if opt.payment_method != "installments":
@@ -463,7 +526,7 @@ def build_candidate_plans(
                     continue
 
                 inst_payments = tuple((d, opt.payment_amount) for d in dates)
-                # Check if already added as safe without changes
+                # Skip if already added as safe without changes
                 already_safe = any(
                     c.recommended_payment_method == "installments"
                     and c.payment_option_id == opt.payment_option_id
@@ -474,9 +537,7 @@ def build_candidate_plans(
                     continue
 
                 for combo in change_combos:
-                    stopped_cats = {c.category for c in combo if c.action == "stop"}
-                    reduced_cats = {c.category: c.new_amount for c in combo if c.action == "reduce_to" and c.new_amount is not None}
-
+                    stream_changes = to_stream_spending_changes(combo)
                     safety = evaluate_schedule_safety(
                         ledger=ledger,
                         request_date=request.request_date,
@@ -484,8 +545,7 @@ def build_candidate_plans(
                         minimum_balance_to_keep=target_min,
                         protected_categories=protected,
                         forecast_days=forecast_days,
-                        stopped_categories=frozenset(stopped_cats) if stopped_cats else None,
-                        reduced_categories=reduced_cats if reduced_cats else None,
+                        stream_spending_changes=stream_changes,
                     )
                     if safety.is_safe:
                         change_strings = tuple(c.change_str for c in combo)
@@ -505,8 +565,7 @@ def build_candidate_plans(
                             number_of_payments=opt.number_of_payments,
                             payment_option_id=opt.payment_option_id,
                             is_safe=True,
-                            stopped_categories=tuple(stopped_cats) if stopped_cats else None,
-                            reduced_categories=tuple(reduced_cats.items()) if reduced_cats else None,
+                            stream_spending_changes=tuple(stream_changes),
                         ))
 
     return candidates
@@ -521,21 +580,18 @@ def candidate_ranking_key(c: CandidatePlan, request: Request) -> Tuple:
 
     1. Completes by desired_completion_date (False < True, so on-time is 0).
     2. Requires no spending changes (False < True, so 0 changes is 0).
-    3. Fewer spending changes (if spending changes are needed).
-    4. Lowest total amount paid (Decimal).
-    5. Earlier first payment (date).
-    6. Fewer payments (int).
-    7. Lowest payment_option_id (str, for tie-breaking).
+    3. Lowest total amount paid (Decimal).
+    4. Earlier first payment (date).
+    5. Fewer payments (int).
+    6. Lowest payment_option_id (str, for tie-breaking).
     """
     is_late = c.completion_date > request.desired_completion_date
     has_spending_changes = len(c.spending_changes) > 0
-    num_spending_changes = len(c.spending_changes)
     opt_id = c.payment_option_id or ""
 
     return (
         is_late,
         has_spending_changes,
-        num_spending_changes,
         c.total_paid,
         c.first_payment_date,
         c.number_of_payments,
@@ -594,14 +650,15 @@ def evaluate_decision(
     ]
 
     if not on_time_candidates:
-        # No safe plan completing on time exists
+        # No safe plan completing on time exists.
+        # Preserve baseline earliest_date_for_full_payment if it exists in the 90-day horizon.
         return DecisionResult(
             request_id=request.request_id,
             amount_safe_to_pay=amount_safe_to_pay,
             affordability_status="not_affordable",
             recommended_payment_method="not_recommended",
             payment_plan="none",
-            earliest_date_for_full_payment=None,
+            earliest_date_for_full_payment=earliest_date_for_full_payment,
             spending_changes_needed="none",
             decision_explanation="Not affordable: no safe payment plan completes by the deadline.",
             candidate_plan=None,
