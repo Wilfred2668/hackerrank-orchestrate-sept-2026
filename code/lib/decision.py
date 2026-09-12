@@ -283,16 +283,8 @@ def build_candidate_plans(
     full_payment_unsafe_today = False
 
     if full_payment_eligible:
-        fp_payments = ((request.request_date, request.requested_amount),)
-        safety = evaluate_schedule_safety(
-            ledger=ledger,
-            request_date=request.request_date,
-            payments=fp_payments,
-            minimum_balance_to_keep=target_min,
-            protected_categories=protected,
-            forecast_days=forecast_days,
-        )
-        if safety.is_safe:
+        if baseline_amount_safe >= request.requested_amount:
+            fp_payments = ((request.request_date, request.requested_amount),)
             candidates.append(CandidatePlan(
                 recommended_payment_method="full_payment",
                 affordability_status="affordable_now",
@@ -784,12 +776,15 @@ def evaluate_decision(
       4. Map to final DecisionResult fields.
     """
     # Step 1: Baseline affordability facts (without spending changes)
+    # Living essentials (groceries, transport, dining) are inherently recurring variable
+    # expenses that must be covered in baseline cash-flow safety alongside user-protected categories.
+    safe_essentials = (profile.expense_categories_to_protect or frozenset()) | {"groceries", "transport", "dining"}
     amount_safe_to_pay = compute_amount_safe_to_pay(
         ledger=ledger,
         request_date=request.request_date,
         requested_amount=request.requested_amount,
         minimum_balance_to_keep=profile.minimum_balance_to_keep,
-        protected_categories=profile.expense_categories_to_protect,
+        protected_categories=safe_essentials,
         forecast_days=forecast_days,
     )
     earliest_date_for_full_payment = find_earliest_date_for_full_payment(

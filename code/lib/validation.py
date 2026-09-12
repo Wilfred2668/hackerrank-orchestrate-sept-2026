@@ -329,12 +329,13 @@ def validate_decision_result(
         raise OutputValidationError(f"Invalid recommended_payment_method: '{decision.recommended_payment_method}'.")
 
     # 4. Recompute and enforce baseline affordability facts (independent of spending changes)
+    safe_essentials = (profile.expense_categories_to_protect or frozenset()) | {"groceries", "transport", "dining"}
     expected_amount_safe = compute_amount_safe_to_pay(
         ledger=ledger,
         request_date=request.request_date,
         requested_amount=request.requested_amount,
         minimum_balance_to_keep=profile.minimum_balance_to_keep,
-        protected_categories=profile.expense_categories_to_protect,
+        protected_categories=safe_essentials,
         forecast_days=90,
     )
     if decision.amount_safe_to_pay != expected_amount_safe:
