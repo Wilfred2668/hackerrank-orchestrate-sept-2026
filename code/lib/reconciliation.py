@@ -17,9 +17,11 @@ Splits each ledger into:
 
 from __future__ import annotations
 
+import calendar
 import logging
+import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from typing import Dict, List, Literal, Optional, Set, Tuple
 
@@ -85,6 +87,7 @@ class DeltaCategoryMatch:
     match_confidence: Literal["high", "low", "none"]
     match_reason: str
     is_unquantifiable: bool = False
+    is_user_general: bool = False
 
 
 @dataclass(frozen=True)
@@ -102,12 +105,13 @@ class ReconciledLedger:
     unquantifiable_commitments: List[UnquantifiableCommitment]
     recurring_salary_amount: Optional[Decimal]
     salary_cancelled: bool
+    user_general_matched_count: int
     matched_deltas_count: int
     unmatched_deltas_count: int
 
 
 # ---------------------------------------------------------------------------
-# Core Recurrence Detection
+# Core Recurrence Detection & Date Helpers
 # ---------------------------------------------------------------------------
 
 def is_recurring_event(event: FinancialEvent, user_events: List[FinancialEvent]) -> bool:
@@ -149,6 +153,27 @@ def is_recurring_event(event: FinancialEvent, user_events: List[FinancialEvent])
                 return True
 
     return False
+
+
+def _get_monthly_dates(start_date: date, end_date: date, day_of_month: int) -> List[date]:
+    """Generate calendar dates with day=day_of_month falling within [start_date, end_date]."""
+    dates: List[date] = []
+    cur_year = start_date.year
+    cur_month = start_date.month
+
+    while (cur_year, cur_month) <= (end_date.year, end_date.month):
+        max_day = calendar.monthrange(cur_year, cur_month)[1]
+        actual_day = min(day_of_month, max_day)
+        candidate = date(cur_year, cur_month, actual_day)
+        if start_date <= candidate <= end_date:
+            dates.append(candidate)
+        if cur_month == 12:
+            cur_year += 1
+            cur_month = 1
+        else:
+            cur_month += 1
+
+    return dates
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +235,7 @@ def match_general_delta_to_category(
     """Decide which ledger category/event a user_general fact applies to.
 
     Matches by user_id + category / event_type + recency — NOT fuzzy text matching.
+    Uses word boundaries to prevent substring collisions (e.g. 'current' != 'rent').
     Logs and flags any delta that cannot be confidently matched.
     """
     action = delta.get("action")
@@ -221,19 +247,23 @@ def match_general_delta_to_category(
             target_event_id=None,
             match_confidence="high",
             match_reason="confirm_no_change signals no ledger modification needed",
+            is_user_general=(delta.get("target") == "user_general"),
         )
 
     target = delta.get("target")
+    is_ug = (target == "user_general")
+
     # 1. Explicit target event ID
     if target and target != "user_general":
         matched_ev = next((e for e in user_events if e.event_id == target), None)
         return DeltaCategoryMatch(
             matched=True,
-            category=matched_ev.category if matched_ev else None,
-            event_type=matched_ev.event_type if matched_ev else None,
+            category=matched_ev.category if matched_ev else "housing",
+            event_type=matched_ev.event_type if matched_ev else "expense",
             target_event_id=target,
             match_confidence="high",
             match_reason=f"Explicit target event_id: {target}",
+            is_user_general=False,
         )
 
     reason = delta.get("reasoning", "").lower()
@@ -252,6 +282,7 @@ def match_general_delta_to_category(
             match_confidence="high",
             match_reason="Childcare commitment matched by reasoning",
             is_unquantifiable=(delta.get("new_value") is None and action == "new_fact"),
+            is_user_general=True,
         )
 
     # 3. Salary arrears adjustments
@@ -265,12 +296,13 @@ def match_general_delta_to_category(
             target_event_id=most_recent.event_id if most_recent else None,
             match_confidence="high",
             match_reason="Salary arrears matched to user's salary income",
+            is_user_general=True,
         )
 
-    # 4. Rent / Lease changes
-    if any(k in reason for k in ["rent", "lease", "sewa"]) or any(
-        k in txt for k in ["rent", "lease", "sewa", "stayledger", "rentnest", "renttrack", "homeportal"]
-    ):
+    # 4. Rent / Lease changes (Word-bounded matching to avoid 'current' matching 'rent')
+    rent_providers = ["stayledger", "rentnest", "renttrack", "homeportal"]
+    rent_keywords = [r"\brent\b", r"\blease\b", r"\bsewa\b", r"\bperpanjangan sewa\b"]
+    if any(p in txt for p in rent_providers) or any(re.search(k, reason) for k in rent_keywords):
         rent_evs = [e for e in user_events if e.category == "rent"]
         most_recent = max(rent_evs, key=lambda e: e.event_date) if rent_evs else None
         return DeltaCategoryMatch(
@@ -280,11 +312,16 @@ def match_general_delta_to_category(
             target_event_id=most_recent.event_id if most_recent else None,
             match_confidence="high",
             match_reason="Rent/lease delta matched to recurring rent events",
+            is_user_general=True,
         )
 
     # 5. Service provider client invoice income
-    if any(k in reason for k in ["invoice", "faktur"]) or any(
-        k in txt for k in ["invoice", "invoiceflow", "faktur", "clientdesk", "freelancehub"]
+    invoice_providers = ["invoiceflow", "clientdesk", "freelancehub"]
+    invoice_keywords = [r"\binvoice\b", r"\bfaktur\b", r"\bclient\b"]
+    if (
+        any(p in txt for p in invoice_providers)
+        or any(re.search(k, reason) for k in invoice_keywords)
+        or (src == "service_provider" and any(re.search(k, txt) for k in invoice_keywords))
     ):
         income_evs = [
             e for e in user_events
@@ -298,11 +335,18 @@ def match_general_delta_to_category(
             target_event_id=most_recent.event_id if most_recent else None,
             match_confidence="high",
             match_reason="Client invoice income matched to freelance/consulting income",
+            is_user_general=True,
         )
 
-    # 6. Employer payroll / salary
-    if src == "employer" or any(k in reason for k in ["salary", "gaji", "pay", "payroll"]) or any(
-        k in txt for k in ["salary", "gaji", "penggajian", "payroll"]
+    # 6. Employer payroll / salary (Word-bounded keywords)
+    salary_keywords = [
+        r"\bsalary\b", r"\bgaji\b", r"\bpayroll\b", r"\bpenggajian\b",
+        r"\bpay\b", r"\bpendapatan\b", r"\bunpaid leave\b", r"\bcontract\b"
+    ]
+    if (
+        src == "employer"
+        or any(re.search(k, reason) for k in salary_keywords)
+        or any(re.search(k, txt) for k in salary_keywords)
     ):
         salary_evs = [e for e in user_events if e.category == "salary"]
         most_recent = max(salary_evs, key=lambda e: e.event_date) if salary_evs else None
@@ -313,6 +357,7 @@ def match_general_delta_to_category(
             target_event_id=most_recent.event_id if most_recent else None,
             match_confidence="high",
             match_reason="Employer payroll delta matched to recurring salary events",
+            is_user_general=True,
         )
 
     # Unmatched fallback
@@ -324,6 +369,7 @@ def match_general_delta_to_category(
         target_event_id=None,
         match_confidence="none",
         match_reason="Could not confidently match delta to any known category or event",
+        is_user_general=is_ug,
     )
 
 
@@ -336,6 +382,7 @@ def reconcile_user_ledger(
     ds: DataStore,
     extracted_data: dict,
     converter: Optional[CurrencyConverter] = None,
+    forecast_days: int = 90,
 ) -> ReconciledLedger:
     """Reconcile the financial ledger for a single user.
 
@@ -343,8 +390,10 @@ def reconcile_user_ledger(
       1. Image amount backfills for blank amounts
       2. Cash-state rules (pending debit reservation, pending credit exclusion, non-cash/unrealized exclusion)
       3. Message deltas conflict-priority resolution & deduplication
-      4. Exact currency normalization to home_currency via CurrencyConverter
-      5. Separation into recurring vs one-time and flexible vs fixed/protected
+      4. Preservation of scheduled salary dates when updating amounts
+      5. Synthesized confirmed recurring salary stream for active salary users
+      6. Exact currency normalization to home_currency via CurrencyConverter
+      7. Separation into recurring vs one-time and flexible vs fixed/protected
     """
     if converter is None:
         converter = CurrencyConverter(ds.exchange_rates)
@@ -356,6 +405,19 @@ def reconcile_user_ledger(
     user_deltas = [d for d in all_deltas if d.get("user_id") == user_id]
     msg_map = {m.message_id: m for m in ds.messages}
 
+    # Find user's evaluation request date
+    request_date: Optional[date] = None
+    if ds is not None:
+        for r in ds.requests:
+            if r.user_id == user_id:
+                request_date = r.request_date
+                break
+        if request_date is None:
+            for r in ds.sample_requests:
+                if r.user_id == user_id:
+                    request_date = r.request_date
+                    break
+
     # Step 1: Fill blank amounts from image extractions unconditionally
     filled_events = fill_blank_amounts(raw_events, image_extractions)
 
@@ -364,7 +426,6 @@ def reconcile_user_ledger(
     # - Ignore pending credits/bonuses/refunds until settled
     # - direction=non_cash and status=unrealized never touch balance
     # - status in ("failed", "cancelled") never touch balance
-    # - linked_event_id chains a lifecycle but does NOT by itself decide cash-flow inclusion
     valid_cash_events: List[FinancialEvent] = []
     for e in filled_events:
         if e.direction == "non_cash" or e.status in ("unrealized", "failed", "cancelled"):
@@ -377,7 +438,9 @@ def reconcile_user_ledger(
     unquantifiable_commitments: List[UnquantifiableCommitment] = []
     salary_cancelled = False
     recurring_salary_amount: Optional[Decimal] = None
+    next_salary_date: Optional[date] = None
     matched_deltas_count = 0
+    user_general_matched_count = 0
     unmatched_deltas_count = 0
     new_events_to_add: List[FinancialEvent] = []
 
@@ -385,6 +448,8 @@ def reconcile_user_ledger(
         action = delta.get("action")
         if action == "confirm_no_change":
             matched_deltas_count += 1
+            if delta.get("target") == "user_general":
+                user_general_matched_count += 1
             continue
 
         msg = msg_map.get(delta.get("message_id"))
@@ -393,7 +458,10 @@ def reconcile_user_ledger(
         if not match_res.matched:
             unmatched_deltas_count += 1
             continue
+
         matched_deltas_count += 1
+        if match_res.is_user_general:
+            user_general_matched_count += 1
 
         # Unquantifiable commitment (new_value is None, action='new_fact')
         if match_res.is_unquantifiable:
@@ -425,11 +493,12 @@ def reconcile_user_ledger(
                 valid_cash_events = filtered
             continue
 
-        # Date amendment
+        # Date amendment (Preserves scheduled event amount, updates dates)
         if action == "amend" and delta.get("field") == "date":
             if delta.get("effective_date"):
                 eff_d = date.fromisoformat(delta["effective_date"])
                 if match_res.category == "salary":
+                    next_salary_date = eff_d
                     updated = []
                     for ev in valid_cash_events:
                         if ev.category == "salary" and ev.status == "scheduled":
@@ -453,7 +522,8 @@ def reconcile_user_ledger(
                     valid_cash_events = updated
             continue
 
-        # Recurring value or amount amendment
+        # Recurring value or amount amendment:
+        # PRESERVES individual event_date and settlement_date when updating amounts!
         if action == "amend" and delta.get("field") in ("recurring_value", "amount"):
             val_str = delta.get("new_value")
             if val_str is not None:
@@ -466,6 +536,7 @@ def reconcile_user_ledger(
                     for ev in valid_cash_events:
                         if ev.category == "salary" and ev.status == "scheduled":
                             if eff_d is None or ev.event_date >= eff_d:
+                                # Update ONLY amount; preserve individual event_date and settlement_date
                                 ev = FinancialEvent(
                                     event_id=ev.event_id,
                                     user_id=ev.user_id,
@@ -475,8 +546,8 @@ def reconcile_user_ledger(
                                     direction=ev.direction,
                                     amount=new_val,
                                     currency=ev.currency,
-                                    event_date=eff_d or ev.event_date,
-                                    settlement_date=eff_d or ev.settlement_date,
+                                    event_date=ev.event_date,          # PRESERVED
+                                    settlement_date=ev.settlement_date,  # PRESERVED
                                     status=ev.status,
                                     linked_event_id=ev.linked_event_id,
                                     flexibility=ev.flexibility,
@@ -490,6 +561,7 @@ def reconcile_user_ledger(
                     for ev in valid_cash_events:
                         if ev.category == "rent" and ev.status == "scheduled":
                             if eff_d is None or ev.event_date >= eff_d:
+                                # Update ONLY amount; preserve individual event_date and settlement_date
                                 ev = FinancialEvent(
                                     event_id=ev.event_id,
                                     user_id=ev.user_id,
@@ -499,8 +571,8 @@ def reconcile_user_ledger(
                                     direction=ev.direction,
                                     amount=new_val,
                                     currency=ev.currency,
-                                    event_date=eff_d or ev.event_date,
-                                    settlement_date=eff_d or ev.settlement_date,
+                                    event_date=ev.event_date,          # PRESERVED
+                                    settlement_date=ev.settlement_date,  # PRESERVED
                                     status=ev.status,
                                     linked_event_id=ev.linked_event_id,
                                     flexibility=ev.flexibility,
@@ -520,6 +592,9 @@ def reconcile_user_ledger(
                     if delta.get("effective_date")
                     else (msg.sent_at.date() if msg else None)
                 )
+
+                if match_res.category == "salary" and delta.get("field") == "recurring_value":
+                    recurring_salary_amount = new_val
 
                 # Deduplication check: does a settled event already describe this fact?
                 already_exists = False
@@ -549,7 +624,7 @@ def reconcile_user_ledger(
                         currency=profile.home_currency,
                         event_date=eff_d,
                         settlement_date=eff_d,
-                        status="settled",
+                        status="scheduled" if (request_date and eff_d >= request_date) else "settled",
                         linked_event_id=None,
                         flexibility="fixed",
                         minimum_allowed_amount=None,
@@ -558,7 +633,69 @@ def reconcile_user_ledger(
 
     valid_cash_events.extend(new_events_to_add)
 
-    # Step 4: Currency Normalization
+    # Step 4: Synthesize Confirmed Recurring Salary Stream
+    # Ensures salary amendments and active recurring salaries are concrete cash events on the ledger
+    if not salary_cancelled and request_date is not None:
+        # Determine baseline active salary amount
+        active_salary_amount: Optional[Decimal] = recurring_salary_amount
+        if active_salary_amount is None:
+            # Check existing scheduled salary
+            sched_sal = next(
+                (e for e in valid_cash_events if e.category == "salary" and e.direction == "credit" and e.status == "scheduled"),
+                None,
+            )
+            if sched_sal is not None:
+                active_salary_amount = sched_sal.amount
+            else:
+                # Check most recent regular settled salary
+                settled_sal = [
+                    e for e in valid_cash_events
+                    if e.category == "salary" and e.direction == "credit" and e.status == "settled"
+                    and not any(k in e.description.lower() for k in ("arrear", "bonus", "one-time", "adjustment"))
+                ]
+                if settled_sal:
+                    active_salary_amount = max(settled_sal, key=lambda x: x.event_date).amount
+
+        if active_salary_amount is not None and active_salary_amount > 0:
+            recurring_salary_amount = active_salary_amount
+            # Determine payday (day of month)
+            if next_salary_date is not None:
+                payday = next_salary_date.day
+            else:
+                existing_sal = [e for e in valid_cash_events if e.category == "salary" and e.direction == "credit"]
+                if existing_sal:
+                    payday = max(existing_sal, key=lambda x: x.event_date).event_date.day
+                else:
+                    payday = 15
+
+            # Forecast window [request_date, request_date + forecast_days]
+            future_dates = _get_monthly_dates(request_date, request_date + timedelta(days=forecast_days), payday)
+            for d_date in future_dates:
+                # Deduplication: check if a salary credit already exists on this date
+                exists_on_date = any(
+                    e.category == "salary" and e.direction == "credit" and (e.settlement_date == d_date or e.event_date == d_date)
+                    for e in valid_cash_events
+                )
+                if not exists_on_date:
+                    synth_ev = FinancialEvent(
+                        event_id=f"sched_sal_{user_id}_{d_date.isoformat()}",
+                        user_id=user_id,
+                        event_type="income",
+                        description="Confirmed scheduled salary",
+                        category="salary",
+                        direction="credit",
+                        amount=active_salary_amount,
+                        currency=profile.home_currency,
+                        event_date=d_date,
+                        settlement_date=d_date,
+                        status="scheduled",
+                        linked_event_id=None,
+                        flexibility="fixed",
+                        minimum_allowed_amount=None,
+                    )
+                    valid_cash_events.append(synth_ev)
+
+    # Step 5: Currency Normalization
     reconciled_events: List[ReconciledEvent] = []
     for e in valid_cash_events:
         settlement_d = e.settlement_date or e.event_date
@@ -610,7 +747,7 @@ def reconcile_user_ledger(
             is_reducible=is_red,
             is_stoppable=is_stop,
             linked_event_id=e.linked_event_id,
-            source_delta_id=e.event_id if e.event_id.startswith("delta_") else None,
+            source_delta_id=e.event_id if (e.event_id.startswith("delta_") or e.event_id.startswith("sched_sal_")) else None,
         )
         reconciled_events.append(rec_ev)
 
@@ -636,6 +773,7 @@ def reconcile_user_ledger(
         unquantifiable_commitments=unquantifiable_commitments,
         recurring_salary_amount=recurring_salary_amount,
         salary_cancelled=salary_cancelled,
+        user_general_matched_count=user_general_matched_count,
         matched_deltas_count=matched_deltas_count,
         unmatched_deltas_count=unmatched_deltas_count,
     )
@@ -649,6 +787,7 @@ def reconcile_all_ledgers(
     ds: DataStore,
     extracted_data: dict,
     converter: Optional[CurrencyConverter] = None,
+    forecast_days: int = 90,
 ) -> Dict[str, ReconciledLedger]:
     """Reconcile financial ledgers for all users in the dataset."""
     if converter is None:
@@ -657,6 +796,6 @@ def reconcile_all_ledgers(
     ledgers: Dict[str, ReconciledLedger] = {}
     for profile in ds.profiles:
         ledgers[profile.user_id] = reconcile_user_ledger(
-            profile.user_id, ds, extracted_data, converter
+            profile.user_id, ds, extracted_data, converter, forecast_days=forecast_days
         )
     return ledgers

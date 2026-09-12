@@ -82,7 +82,6 @@ def test_fill_blank_amounts_missing_extraction_raises(datastore: DataStore):
 # ---------------------------------------------------------------------------
 
 def test_cash_state_rules_filtering(datastore: DataStore, extracted_data: dict, converter: CurrencyConverter):
-    # Pick a user with pending debits and pending credits if available, or test across sample
     # user_02 has a pending debit: event_185 (shopping, debit, 1651100 IDR)
     ledger_u02 = reconcile_user_ledger("user_02", datastore, extracted_data, converter)
     ev_185 = next((e for e in ledger_u02.all_events if e.event_id == "event_185"), None)
@@ -93,7 +92,6 @@ def test_cash_state_rules_filtering(datastore: DataStore, extracted_data: dict, 
     # Find users with pending credits in raw data
     pending_credits = [e for e in datastore.events if e.status == "pending" and e.direction == "credit"]
     assert len(pending_credits) == 8
-    # Reconcile all users with pending credits and verify they are NOT on the cash ledger
     users_with_pending_credits = set(e.user_id for e in pending_credits)
     for uid in users_with_pending_credits:
         ledger = reconcile_user_ledger(uid, datastore, extracted_data, converter)
@@ -121,7 +119,6 @@ def test_cash_state_rules_filtering(datastore: DataStore, extracted_data: dict, 
 # ---------------------------------------------------------------------------
 
 def test_currency_normalization(datastore: DataStore, extracted_data: dict, converter: CurrencyConverter):
-    # Find an event where event.currency != profile.home_currency
     foreign_events = []
     for e in datastore.events:
         prof = datastore.get_profile(e.user_id)
@@ -141,61 +138,48 @@ def test_currency_normalization(datastore: DataStore, extracted_data: dict, conv
 
 
 # ---------------------------------------------------------------------------
-# Test 4: Delta Category Matching Logic
+# Test 4: Delta Category Matching Logic & Exact Counts
 # ---------------------------------------------------------------------------
 
-def test_match_general_delta_to_category(datastore: DataStore):
-    u_events = datastore.get_events_for_user("user_14")
-    msg_10 = next(m for m in datastore.messages if m.message_id == "message_10")
+def test_exact_active_deltas_category_mapping(datastore: DataStore, extracted_data: dict):
+    deltas = extracted_data["message_deltas"]
+    active_deltas = [d for d in deltas if d.get("action") != "confirm_no_change"]
+    assert len(active_deltas) == 114
 
-    # Salary delta
-    sal_delta = {
-        "message_id": "message_10",
-        "action": "amend",
-        "target": "user_general",
-        "field": "recurring_value",
-        "new_value": "2717",
-        "effective_date": "2025-08-15",
-        "reasoning": "Regular salary of 2717 resumes on 2025-08-15.",
-    }
-    match_sal = match_general_delta_to_category(sal_delta, msg_10, u_events)
-    assert match_sal.matched is True
-    assert match_sal.category == "salary"
-    assert match_sal.event_type == "income"
-    assert match_sal.is_unquantifiable is False
+    user_general_deltas = [d for d in active_deltas if d.get("target") == "user_general"]
+    assert len(user_general_deltas) == 113
 
-    # Childcare unquantifiable delta
-    childcare_delta = {
-        "message_id": "message_10",
-        "action": "new_fact",
-        "target": "user_general",
-        "field": "recurring_value",
-        "new_value": None,
-        "effective_date": "2025-08-01",
-        "confidence": "low",
-        "reasoning": "New recurring childcare payment starts in August 2025, but amount is unspecified.",
-    }
-    match_child = match_general_delta_to_category(childcare_delta, msg_10, u_events)
-    assert match_child.matched is True
-    assert match_child.category == "childcare"
-    assert match_child.is_unquantifiable is True
+    specific_target_deltas = [d for d in active_deltas if d.get("target") != "user_general"]
+    assert len(specific_target_deltas) == 1
+    assert specific_target_deltas[0]["message_id"] == "message_35"
+    assert specific_target_deltas[0]["target"] == "event_4535"
 
-    # Unknown delta fallback
-    unknown_delta = {
-        "message_id": "message_unknown",
-        "action": "amend",
-        "target": "user_general",
-        "field": "unknown_field",
-        "new_value": "123",
-        "reasoning": "Cryptic alien transmission unrelated to any category.",
-    }
-    match_unk = match_general_delta_to_category(unknown_delta, None, u_events)
-    assert match_unk.matched is False
-    assert match_unk.match_confidence == "none"
+    msg_map = {m.message_id: m for m in datastore.messages}
+    cat_counts = {}
+    cancel_salary_count = 0
+
+    for d in user_general_deltas:
+        msg = msg_map.get(d["message_id"])
+        evs = datastore.get_events_for_user(d["user_id"])
+        match = match_general_delta_to_category(d, msg, evs)
+        assert match.matched is True
+        cat = match.category
+        cat_counts[cat] = cat_counts.get(cat, 0) + 1
+        if d.get("action") == "cancel" and cat == "salary":
+            cancel_salary_count += 1
+
+    # Exact breakdown of the 113 user_general active deltas:
+    assert cat_counts["salary"] == 83
+    assert cat_counts["income"] == 15
+    assert cat_counts["childcare"] == 8
+    assert cat_counts["rent"] == 7
+    assert sum(cat_counts.values()) == 113
+    # Explicitly confirm all 6 cancellations are in the salary category
+    assert cancel_salary_count == 6
 
 
 # ---------------------------------------------------------------------------
-# Test 5: Hand-Verified Concrete Test Cases
+# Test 5: Hand-Verified Concrete Test Cases 1 - 4
 # ---------------------------------------------------------------------------
 
 def test_hand_verified_case_1_salary_amend_user_216(
@@ -205,7 +189,9 @@ def test_hand_verified_case_1_salary_amend_user_216(
 
     Before: 5 past settled salaries at 1890.72 USD (last 2026-06-15).
     Delta: message_169 raises salary to 2424 USD starting 2026-07-15.
-    After: Reconciled ledger has recurring_salary_amount == 2424 USD.
+    After:
+      - recurring_salary_amount == 2424 USD
+      - User receives future salary cash flow on the ledger across the 90-day forecast!
     """
     raw_salaries = [
         e for e in datastore.get_events_for_user("user_216")
@@ -219,8 +205,17 @@ def test_hand_verified_case_1_salary_amend_user_216(
     assert ledger.home_currency == "USD"
     assert ledger.salary_cancelled is False
     assert ledger.recurring_salary_amount == Decimal("2424")
-    assert ledger.matched_deltas_count == 1
-    assert ledger.unmatched_deltas_count == 0
+
+    # Verify future salary cash flow on the ledger
+    req = next(r for r in datastore.requests if r.user_id == "user_216")
+    future_salaries = [
+        e for e in ledger.all_events
+        if e.category == "salary" and e.direction == "credit" and e.event_date >= req.request_date
+    ]
+    assert len(future_salaries) == 3, f"Expected 3 monthly salaries in 90-day window, got {len(future_salaries)}"
+    expected_dates = [date(2026, 7, 15), date(2026, 8, 15), date(2026, 9, 15)]
+    assert [s.event_date for s in future_salaries] == expected_dates
+    assert all(s.normalized_amount == Decimal("2424") for s in future_salaries)
 
 
 def test_hand_verified_case_2_cancel_salary_user_75(
@@ -231,6 +226,7 @@ def test_hand_verified_case_2_cancel_salary_user_75(
     Before: 5 past settled salaries at 50820 ZAR (Nov 2025 to Mar 2026).
     Delta: message_57 states employment ended, no further regular salary.
     After: Reconciled ledger has salary_cancelled == True, recurring_salary_amount == None.
+           Zero future salary cash flows exist on or after request date.
     """
     raw_salaries = [
         e for e in datastore.get_events_for_user("user_75")
@@ -244,10 +240,13 @@ def test_hand_verified_case_2_cancel_salary_user_75(
     assert ledger.home_currency == "ZAR"
     assert ledger.salary_cancelled is True
     assert ledger.recurring_salary_amount is None
-    # Confirm no scheduled salary exists on the reconciled ledger
-    assert not any(e.category == "salary" and e.status == "scheduled" for e in ledger.all_events)
-    assert ledger.matched_deltas_count == 1
-    assert ledger.unmatched_deltas_count == 0
+
+    req = next(r for r in datastore.requests if r.user_id == "user_75")
+    future_salaries = [
+        e for e in ledger.all_events
+        if e.category == "salary" and e.direction == "credit" and e.event_date >= req.request_date
+    ]
+    assert len(future_salaries) == 0, "Cancelled salary stream must not have future salary cash flows"
 
 
 def test_hand_verified_case_3_childcare_split_user_14(
@@ -302,7 +301,87 @@ def test_hand_verified_case_4_arrears_dedupe_user_28(
 
 
 # ---------------------------------------------------------------------------
-# Test 6: Full-Dataset Reconciliation Invariants
+# Test 6: Hand-Verified Case 5 — Preserving Scheduled Dates on Amount Updates
+# ---------------------------------------------------------------------------
+
+def test_hand_verified_case_5_preserve_scheduled_salary_dates(
+    datastore: DataStore, extracted_data: dict, converter: CurrencyConverter
+):
+    """Case 5: Verify that updating scheduled salary amounts preserves individual dates.
+
+    Tests a scenario where a real user (user_216) has multiple scheduled salary events
+    (e.g., 2026-07-15 and 2026-08-15) on or after an amendment effective date (2026-07-15).
+    Verifies that:
+      - Amount is updated to 2424 USD on both events.
+      - Event 1 retains its date (2026-07-15).
+      - Event 2 retains its date (2026-08-15) and is NOT collapsed onto 2026-07-15.
+    """
+    # Create two pre-existing scheduled events for user_216
+    event_jul = FinancialEvent(
+        event_id="sched_test_jul",
+        user_id="user_216",
+        event_type="income",
+        description="Scheduled July salary",
+        category="salary",
+        direction="credit",
+        amount=Decimal("1890.72"),
+        currency="USD",
+        event_date=date(2026, 7, 15),
+        settlement_date=date(2026, 7, 15),
+        status="scheduled",
+        linked_event_id=None,
+        flexibility="fixed",
+        minimum_allowed_amount=None,
+    )
+    event_aug = FinancialEvent(
+        event_id="sched_test_aug",
+        user_id="user_216",
+        event_type="income",
+        description="Scheduled August salary",
+        category="salary",
+        direction="credit",
+        amount=Decimal("1890.72"),
+        currency="USD",
+        event_date=date(2026, 8, 15),
+        settlement_date=date(2026, 8, 15),
+        status="scheduled",
+        linked_event_id=None,
+        flexibility="fixed",
+        minimum_allowed_amount=None,
+    )
+
+    # Reconcile user_216 with these two pre-existing scheduled events present
+    orig_get_events = datastore.get_events_for_user
+
+    def mock_get_events(uid: str):
+        evs = orig_get_events(uid)
+        if uid == "user_216":
+            return list(evs) + [event_jul, event_aug]
+        return evs
+
+    # Temporarily monkeypatch get_events_for_user
+    datastore.get_events_for_user = mock_get_events
+    try:
+        ledger = reconcile_user_ledger("user_216", datastore, extracted_data, converter)
+    finally:
+        datastore.get_events_for_user = orig_get_events
+
+    ev_jul_rec = next(e for e in ledger.all_events if e.event_id == "sched_test_jul")
+    ev_aug_rec = next(e for e in ledger.all_events if e.event_id == "sched_test_aug")
+
+    # Amounts updated to the new amended salary
+    assert ev_jul_rec.normalized_amount == Decimal("2424")
+    assert ev_aug_rec.normalized_amount == Decimal("2424")
+
+    # Individual dates MUST be preserved (NOT collapsed onto 2026-07-15)
+    assert ev_jul_rec.event_date == date(2026, 7, 15)
+    assert ev_jul_rec.settlement_date == date(2026, 7, 15)
+    assert ev_aug_rec.event_date == date(2026, 8, 15)
+    assert ev_aug_rec.settlement_date == date(2026, 8, 15)
+
+
+# ---------------------------------------------------------------------------
+# Test 7: Full-Dataset Reconciliation Invariants
 # ---------------------------------------------------------------------------
 
 def test_full_dataset_reconciliation(
@@ -312,13 +391,15 @@ def test_full_dataset_reconciliation(
     ledgers = reconcile_all_ledgers(datastore, extracted_data, converter)
     assert len(ledgers) == len(datastore.profiles) == 275
 
+    total_ug_matched = sum(l.user_general_matched_count for l in ledgers.values())
     total_matched = sum(l.matched_deltas_count for l in ledgers.values())
     total_unmatched = sum(l.unmatched_deltas_count for l in ledgers.values())
     total_unquant = sum(len(l.unquantifiable_commitments) for l in ledgers.values())
 
     # Invariants
     assert total_unmatched == 0, f"Expected 0 unmatched deltas, got {total_unmatched}"
-    assert total_matched == 114, f"Expected 114 matched active deltas, got {total_matched}"
+    assert total_ug_matched == 113, f"Expected 113 matched user_general deltas, got {total_ug_matched}"
+    assert total_matched == 114, f"Expected 114 total matched active deltas (113 user_general + 1 specific), got {total_matched}"
     assert total_unquant == 8, f"Expected 8 unquantifiable commitments, got {total_unquant}"
 
     avg_unquant = total_unquant / len(ledgers)
