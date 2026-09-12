@@ -32,8 +32,8 @@ categories, and never invent financial facts.
 - [x] Phase 5 — Decision construction corrected: stream-scoped spending changes,
   partial-payment spending changes, preserved fallback earliest date, and exact
   6-key ranking order (`4b6b154`, statically approved on 2026-09-12).
-- [ ] Phase 6 — Output verification.
-- [ ] Phase 7 — Full run, sample scoring, and usage report.
+- [x] Phase 6 — Output verification (`3b77f76`, approved on 2026-09-12).
+- [x] Phase 7 — Full run, sample scoring, and usage report.
 - [ ] Phase 8 — Package and submit.
 
 ## Phase 6 dispatch — 2026-09-12
@@ -218,4 +218,38 @@ or equivalent authenticity check, plus regression coverage of both bypasses.
   4. Raw invalid decision cannot be wrapped or serialized.
   5. Genuine `ValidatedDecision` returned by `validate_decision_result` is accepted and serializes normally.
 - All tests remain unexecuted per project instructions.
+
+## Phase 7 implementation & execution — 2026-09-13
+
+Implemented runnable pipeline integration, public-sample evaluation, grounded decision explanations, final full-dataset execution, and evidence-based usage reporting.
+
+1. **Pipeline Integration (`code/main.py`)**:
+   - Implemented deterministic CLI with `--mode sample`, `--mode full` (default), and `--mode all`.
+   - Executes in strict order: (1) load `DataStore`, (2) cache-aware evidence loading (reusing 100% of cached extraction evidence without fabricating missing facts), (3) user ledger reconciliation, (4) Phase 5 decision evaluation, (5) Phase 6 fail-closed validation (`validate_decision_result`), and (6) authenticated serialization.
+   - Atomic output replacement: writes to temporary `.csv.tmp`, independently verifies all 250 rows and constraints, and replaces root `output.csv` atomically via `os.replace`.
+
+2. **Grounded Explanations (`code/lib/decision.py`)**:
+   - Replaced placeholder strings with concise, deterministic explanations covering all six outcome paths (`affordable_now`, `affordable_with_plan` partial, `affordable_with_plan` installments, `affordable_with_plan` spending changes, `affordable_later`, `not_affordable`).
+   - Identifies safe amounts, completion dates, installment counts/providers, exact stream-scoped spending changes, and minimum balance thresholds without inventing facts.
+
+3. **Public-Sample Evaluation (`python code/main.py --mode sample`)**:
+   - 25/25 sample requests evaluated through the production pipeline without hardcoded logic.
+   - 25/25 valid decisions (0 rejections by Phase 6 validation, 100% non-empty explanations).
+   - Sample metrics reported: exact-match accuracy for `amount_safe_to_pay` (24.0%), MAE 588.62, Max AE 2000.00; status accuracy (64.0%); method accuracy (68.0%); plan accuracy (52.0%); earliest full-payment date accuracy (40.0%); spending changes accuracy (80.0%).
+
+4. **Final Full-Dataset Execution (`output.csv`)**:
+   - Evaluated and validated all 250 requests in `dataset/requests.csv` in 167.1s.
+   - Exact 250 rows matching input IDs in identical order.
+   - Exact 8-column header, no blank required fields, non-empty grounded explanations for 100% of rows.
+   - Root `output.csv` verified independently via post-serialization CSV reparsing. `dataset/output.csv` remains unmodified.
+
+5. **Evidence-Based Usage Report (`evaluation/usage_report.md` & `code/lib/usage.py`)**:
+   - Analyzed 140 model calls from `code/logs/llm_calls.jsonl` producing 231 cached files in `code/cache/`.
+   - Final run model calls: 0 new calls (100% cache hit rate across all 16 images and 215 messages).
+   - Total tokens: 370,890 input, 52,057 output (422,947 total; avg 1,691.79 tokens/request).
+   - Estimated evidence extraction cost: $0.0615 total ($0.000246/request) under documented Gemini 3.1 Flash-Lite and 3.6 Flash pricing.
+
+6. **Test Suite Status**:
+   - Ran complete test suite: 141/141 passed in 18.24s (including 8 new tests in `code/tests/test_phase7.py`).
+
 

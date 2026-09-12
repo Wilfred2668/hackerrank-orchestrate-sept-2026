@@ -617,6 +617,155 @@ def candidate_ranking_key(c: CandidatePlan, request: Request) -> Tuple:
     )
 
 
+def _format_date(d: date) -> str:
+    """Format date as e.g. '15 November 2019' or '8 August 2025'."""
+    return f"{d.day} {d.strftime('%B')} {d.year}"
+
+
+def _format_money(val: Decimal) -> str:
+    """Format monetary decimal cleanly with commas for thousands."""
+    cleaned = clean_decimal(val)
+    parts = str(cleaned).split(".")
+    int_part = f"{int(parts[0]):,}"
+    if len(parts) > 1:
+        return f"{int_part}.{parts[1]}"
+    return int_part
+
+
+def _describe_spending_changes(
+    spending_changes_str: str,
+    ledger: ReconciledLedger,
+    currency: str,
+) -> str:
+    """Describe required spending changes using grounded ledger descriptions."""
+    if not spending_changes_str or spending_changes_str == "none":
+        return ""
+
+    event_by_id = {e.event_id: e for e in ledger.all_events}
+    descriptions: List[str] = []
+
+    for item in spending_changes_str.split("|"):
+        item = item.strip()
+        if not item:
+            continue
+        if item.startswith("stop:"):
+            ev_id = item.split(":", 1)[1]
+            ev = event_by_id.get(ev_id)
+            name = ev.description.strip() if ev and ev.description else ev_id
+            if not name.isupper():
+                name = name[0].lower() + name[1:] if len(name) > 1 else name.lower()
+            descriptions.append(f"stop the {name}")
+        elif item.startswith("reduce_to:"):
+            parts = item.split(":")
+            if len(parts) == 3:
+                ev_id, new_amt_str = parts[1], parts[2]
+                ev = event_by_id.get(ev_id)
+                name = ev.description.strip() if ev and ev.description else ev_id
+                if not name.isupper():
+                    name = name[0].lower() + name[1:] if len(name) > 1 else name.lower()
+                amt_formatted = _format_money(Decimal(new_amt_str))
+                descriptions.append(f"reduce the {name} to {currency} {amt_formatted}")
+            else:
+                descriptions.append(f"reduce {item}")
+        else:
+            descriptions.append(item)
+
+    if not descriptions:
+        return ""
+    if len(descriptions) == 1:
+        desc_text = descriptions[0]
+    elif len(descriptions) == 2:
+        desc_text = f"{descriptions[0]} and {descriptions[1]}"
+    else:
+        desc_text = f"{', '.join(descriptions[:-1])}, and {descriptions[-1]}"
+
+    return desc_text[0].upper() + desc_text[1:]
+
+
+def generate_decision_explanation(
+    request: Request,
+    profile: FinancialProfile,
+    ledger: ReconciledLedger,
+    amount_safe_to_pay: Decimal,
+    affordability_status: str,
+    recommended_payment_method: str,
+    payment_plan: str,
+    earliest_date_for_full_payment: Optional[date],
+    spending_changes_needed: str,
+    candidate_plan: Optional[CandidatePlan] = None,
+) -> str:
+    """Generate a concise, grounded, deterministic decision explanation from decision facts."""
+    curr = profile.home_currency
+    req_amt_str = f"{curr} {_format_money(request.requested_amount)}"
+    min_bal_str = f"{curr} {_format_money(profile.minimum_balance_to_keep)}"
+
+    if affordability_status == "affordable_now" and recommended_payment_method == "full_payment":
+        return (
+            f"Pay {req_amt_str} today. "
+            f"This leaves at least {min_bal_str} available over the next 90 days."
+        )
+
+    if affordability_status == "affordable_with_plan":
+        if recommended_payment_method == "full_payment":
+            changes_desc = _describe_spending_changes(spending_changes_needed, ledger, curr)
+            if changes_desc:
+                return (
+                    f"{changes_desc}, then pay {req_amt_str} today. "
+                    f"This leaves at least {min_bal_str} available."
+                )
+            return (
+                f"Pay {req_amt_str} today with spending changes. "
+                f"This leaves at least {min_bal_str} available."
+            )
+
+        if recommended_payment_method == "partial_payment":
+            first_amt_str = f"{curr} {_format_money(amount_safe_to_pay)}"
+            rem_amt = request.requested_amount - amount_safe_to_pay
+            rem_amt_str = f"{curr} {_format_money(rem_amt)}"
+            date_str = _format_date(earliest_date_for_full_payment) if earliest_date_for_full_payment else "a later date"
+            return (
+                f"Pay {first_amt_str} today and the remaining {rem_amt_str} on {date_str}. "
+                f"This completes the full request and keeps the {min_bal_str} minimum protected."
+            )
+
+        if recommended_payment_method == "installments":
+            if candidate_plan and candidate_plan.payments:
+                count = candidate_plan.number_of_payments
+                first_date = candidate_plan.first_payment_date
+                first_date_str = _format_date(first_date)
+                inst_amt = candidate_plan.payments[0][1]
+                inst_amt_str = f"{curr} {_format_money(inst_amt)}"
+                changes_desc = _describe_spending_changes(spending_changes_needed, ledger, curr)
+                prefix = f"{changes_desc}, then " if changes_desc else ""
+                return (
+                    f"{prefix}Use {count} installments of {inst_amt_str}, starting {first_date_str}. "
+                    f"This leaves at least {min_bal_str} available."
+                )
+            return f"Use an installment plan. This leaves at least {min_bal_str} available."
+
+    if affordability_status == "affordable_later" and recommended_payment_method == "wait":
+        full_date = earliest_date_for_full_payment or (candidate_plan.first_payment_date if candidate_plan else None)
+        date_str = _format_date(full_date) if full_date else "a later date"
+        return (
+            f"Pay {req_amt_str} in full on {date_str}. "
+            f"Paying earlier would take the balance below the {min_bal_str} minimum."
+        )
+
+    # not_affordable / not_recommended
+    if earliest_date_for_full_payment is None:
+        avail_str = f"{curr} {_format_money(amount_safe_to_pay)}"
+        return (
+            f"Do not proceed with the {req_amt_str} request. "
+            f"Although {avail_str} is available today, the full amount cannot be completed safely within 90 days."
+        )
+    else:
+        deadline_str = _format_date(request.desired_completion_date)
+        return (
+            f"Do not make this payment by {deadline_str}. "
+            f"None of the available options keeps the {min_bal_str} minimum protected."
+        )
+
+
 def evaluate_decision(
     request: Request,
     profile: FinancialProfile,
@@ -670,6 +819,18 @@ def evaluate_decision(
     if not on_time_candidates:
         # No safe plan completing on time exists.
         # Preserve baseline earliest_date_for_full_payment if it exists in the 90-day horizon.
+        explanation = generate_decision_explanation(
+            request=request,
+            profile=profile,
+            ledger=ledger,
+            amount_safe_to_pay=amount_safe_to_pay,
+            affordability_status="not_affordable",
+            recommended_payment_method="not_recommended",
+            payment_plan="none",
+            earliest_date_for_full_payment=earliest_date_for_full_payment,
+            spending_changes_needed="none",
+            candidate_plan=None,
+        )
         return DecisionResult(
             request_id=request.request_id,
             amount_safe_to_pay=amount_safe_to_pay,
@@ -678,7 +839,7 @@ def evaluate_decision(
             payment_plan="none",
             earliest_date_for_full_payment=earliest_date_for_full_payment,
             spending_changes_needed="none",
-            decision_explanation="Not affordable: no safe payment plan completes by the deadline.",
+            decision_explanation=explanation,
             candidate_plan=None,
         )
 
@@ -694,6 +855,19 @@ def evaluate_decision(
         else earliest_date_for_full_payment
     )
 
+    explanation = generate_decision_explanation(
+        request=request,
+        profile=profile,
+        ledger=ledger,
+        amount_safe_to_pay=amount_safe_to_pay,
+        affordability_status=best.affordability_status,
+        recommended_payment_method=best.recommended_payment_method,
+        payment_plan=best.payment_plan_str,
+        earliest_date_for_full_payment=final_earliest_date,
+        spending_changes_needed=best.spending_changes_str,
+        candidate_plan=best,
+    )
+
     return DecisionResult(
         request_id=request.request_id,
         amount_safe_to_pay=amount_safe_to_pay,
@@ -702,6 +876,6 @@ def evaluate_decision(
         payment_plan=best.payment_plan_str,
         earliest_date_for_full_payment=final_earliest_date,
         spending_changes_needed=best.spending_changes_str,
-        decision_explanation=f"Recommended {best.recommended_payment_method} plan.",
+        decision_explanation=explanation,
         candidate_plan=best,
     )

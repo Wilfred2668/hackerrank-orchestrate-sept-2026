@@ -87,12 +87,11 @@ def _build_test_request(
         request_id=request_id,
         user_id=user_id,
         request_date=request_date,
-        item_description="Test Laptop Purchase",
-        category="electronics",
+        request_type="purchase",
         requested_amount=requested_amount,
-        currency="USD",
         desired_completion_date=desired_completion_date,
         allows_partial_payment=allows_partial_payment,
+        request_text="Test request",
     )
 
 
@@ -205,12 +204,12 @@ def _build_test_payment_option(
         payment_option_id=payment_option_id,
         request_id=request_id,
         payment_method=payment_method,  # type: ignore[arg-type]
-        number_of_payments=number_of_payments,
         payment_amount=payment_amount,
-        total_payable_amount=total_payable_amount,
-        currency="USD",
+        number_of_payments=number_of_payments,
         first_payment_date=first_payment_date,
         payment_frequency_days=payment_frequency_days,
+        financing_fee=Decimal("0.00"),
+        total_payable_amount=total_payable_amount,
     )
 
 
@@ -1172,10 +1171,10 @@ def test_serialization_exact_columns_and_formatting():
 
     decision = DecisionResult(
         request_id=req.request_id,
-        amount_safe_to_pay=Decimal("1250.00"),
+        amount_safe_to_pay=Decimal("1225.00"),
         affordability_status="affordable_with_plan",
         recommended_payment_method="partial_payment",
-        payment_plan="2026-05-01:1250|2026-05-20:1250",
+        payment_plan="2026-05-01:1225|2026-05-20:1275",
         earliest_date_for_full_payment=date(2026, 5, 20),
         spending_changes_needed="stop:ev_sub_01",
         decision_explanation="Approved with partial payment and streaming cancellation.",
@@ -1188,10 +1187,10 @@ def test_serialization_exact_columns_and_formatting():
     assert len(row) == 8
     assert row == [
         req.request_id,
-        "1250",
+        "1225",
         "affordable_with_plan",
         "partial_payment",
-        "2026-05-01:1250|2026-05-20:1250",
+        "2026-05-01:1225|2026-05-20:1275",
         "2026-05-20",
         "stop:ev_sub_01",
         "Approved with partial payment and streaming cancellation.",
@@ -1199,7 +1198,7 @@ def test_serialization_exact_columns_and_formatting():
 
     line = serialize_decision_csv_line(validated)
     assert line.endswith("\n")
-    assert "1250,affordable_with_plan,partial_payment" in line
+    assert "1225,affordable_with_plan,partial_payment" in line
 
     csv_output = serialize_decisions_to_csv([validated])
     header, data_line = csv_output.strip().split("\n")
