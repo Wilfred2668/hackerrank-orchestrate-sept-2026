@@ -715,13 +715,14 @@ def reconcile_user_ledger(
     if not salary_cancelled and request_date is not None:
         # Determine baseline active salary amount
         active_salary_amount: Optional[Decimal] = recurring_salary_amount
-        active_salary_currency: Optional[str] = None
+        NON_REGULAR_SALARY_KEYWORDS = (
+            "arrear", "bonus", "commission", "one-time", "adjustment", "final", "severance",
+            "payout", "marketplace", "platform", "app earnings",
+        )
         regular_salary_events = [
             e for e in valid_cash_events
             if e.category == "salary" and e.direction == "credit"
-            and not any(k in e.description.lower() for k in (
-                "arrear", "bonus", "commission", "one-time", "adjustment", "final", "severance"
-            ))
+            and not any(k in e.description.lower() for k in NON_REGULAR_SALARY_KEYWORDS)
         ]
         # A message amendment changes the amount but does not change the currency
         # of the established salary stream.
@@ -743,7 +744,7 @@ def reconcile_user_ledger(
                 settled_sal = [
                     e for e in valid_cash_events
                     if e.category == "salary" and e.direction == "credit" and e.status == "settled"
-                    and not any(k in e.description.lower() for k in ("arrear", "bonus", "commission", "one-time", "adjustment", "final"))
+                    and not any(k in e.description.lower() for k in NON_REGULAR_SALARY_KEYWORDS)
                 ]
                 if settled_sal:
                     latest_settled_sal = max(settled_sal, key=lambda x: (x.event_date, x.event_id))
@@ -760,7 +761,7 @@ def reconcile_user_ledger(
                 existing_sal = [
                     e for e in valid_cash_events
                     if e.category == "salary" and e.direction == "credit"
-                    and not any(k in e.description.lower() for k in ("arrear", "bonus", "commission", "one-time", "adjustment", "final"))
+                    and not any(k in e.description.lower() for k in NON_REGULAR_SALARY_KEYWORDS)
                 ]
                 payday = infer_salary_payday(existing_sal)
 
