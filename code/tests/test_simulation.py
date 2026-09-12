@@ -17,6 +17,12 @@ Phase 4 Recurrence Forecasting Tests:
   11. A scheduled recurring occurrence already present in the ledger is not duplicated.
   12. Monthly cadence works through a month-end boundary (31st day landing on February's final day).
   13. A recurring salary already synthesized by Phase 3 is not duplicated by Phase 4.
+
+Phase 4 Conservative Variable Essentials Tests:
+  14. Protected groceries with only historical records create future forecast debits.
+  15. Those grocery debits turn an otherwise-safe payment into unsafe.
+  16. Frequent but unprotected/optional dining is not forecast.
+  17. A known pending or scheduled essential debit is not duplicated.
 """
 
 from __future__ import annotations
@@ -42,6 +48,7 @@ from lib.simulation import (
     evaluate_schedule_safety,
     find_earliest_date_for_full_payment,
     generate_future_recurring_occurrences,
+    generate_future_variable_essential_occurrences,
     get_conservative_recurring_amount,
     get_recurring_cadence_day,
     simulate_cash_flow,
@@ -67,6 +74,7 @@ def _build_test_ledger(
     current_available_balance: Decimal = Decimal("10000.00"),
     minimum_balance_to_keep: Decimal = Decimal("2000.00"),
     events: list[ReconciledEvent] | None = None,
+    protected_categories: frozenset[str] | None = None,
 ) -> ReconciledLedger:
     """Helper to construct a controlled ReconciledLedger for unit testing."""
     ev_list = events or []
@@ -86,6 +94,8 @@ def _build_test_ledger(
         user_general_matched_count=0,
         matched_deltas_count=0,
         unmatched_deltas_count=0,
+        no_change_deltas_count=0,
+        protected_categories=protected_categories if protected_categories is not None else frozenset(),
     )
 
 
@@ -495,58 +505,24 @@ def test_scenario_8_real_dataset_sample_requests(datastore: DataStore, extracted
 
 
 # ===========================================================================
-# Phase 4 Recurrence Forecasting Tests (Required by Section 3)
+# Phase 4 Recurrence Forecasting Tests
 # ===========================================================================
 
 def test_historical_monthly_rent_charged_again_during_forecast():
-    """Historical monthly rent with no future scheduled row is charged again during the forecast.
-
-    Setup:
-      - Starting balance: 15,000.00
-      - Minimum balance to keep: 2,000.00
-      - Request date: 2026-05-15 (horizon ends 2026-08-13)
-      - History: Settled rent of 3,000.00 on the 1st of March, April, and May 2026.
-      - No future scheduled rent rows in ledger.all_events.
-    Hand calculation of daily balances:
-      - 2026-05-15 to 2026-05-31: 15,000.00
-      - On 2026-06-01: Rent charged (-3,000.00) -> Balance drops to 12,000.00
-      - On 2026-07-01: Rent charged (-3,000.00) -> Balance drops to 9,000.00
-      - On 2026-08-01: Rent charged (-3,000.00) -> Balance drops to 6,000.00
-      - 2026-08-02 to 2026-08-13: 6,000.00
-      - Minimum projected balance = 6,000.00
-    """
+    """Historical monthly rent with no future scheduled row is charged again during the forecast."""
     req_date = date(2026, 5, 15)
     rent_events = [
         _build_test_event(
-            event_id="rent_01",
-            event_date=date(2026, 3, 1),
-            settlement_date=date(2026, 3, 1),
+            event_id=f"rent_{m}",
+            event_date=date(2026, m, 1),
+            settlement_date=date(2026, m, 1),
             direction="debit",
             amount=Decimal("3000.00"),
             category="rent",
             is_recurring=True,
             description="Monthly rent",
-        ),
-        _build_test_event(
-            event_id="rent_02",
-            event_date=date(2026, 4, 1),
-            settlement_date=date(2026, 4, 1),
-            direction="debit",
-            amount=Decimal("3000.00"),
-            category="rent",
-            is_recurring=True,
-            description="Monthly rent",
-        ),
-        _build_test_event(
-            event_id="rent_03",
-            event_date=date(2026, 5, 1),
-            settlement_date=date(2026, 5, 1),
-            direction="debit",
-            amount=Decimal("3000.00"),
-            category="rent",
-            is_recurring=True,
-            description="Monthly rent",
-        ),
+        )
+        for m in (3, 4, 5)
     ]
     ledger = _build_test_ledger(
         current_available_balance=Decimal("15000.00"),
@@ -575,22 +551,7 @@ def test_historical_monthly_rent_charged_again_during_forecast():
 
 
 def test_projected_rent_changes_safe_payment_to_unsafe():
-    """Projected rent changes an otherwise-safe payment into an unsafe one.
-
-    Setup:
-      - Starting balance: 15,000.00
-      - Minimum balance to keep: 2,000.00
-      - Proposed payment: 10,000.00 on 2026-05-15
-      - Rent: 3,000.00 on 1st of each month (settled on 2026-03-01, 2026-04-01, 2026-05-01)
-    Without rent forecasting (ignoring recurring commitments):
-      - Balance after payment = 15,000 - 10,000 = 5,000.00 >= 2,000.00 (False positive: SAFE!)
-    With rent forecasting (correct Phase 4):
-      - On 2026-05-15: Balance = 5,000.00
-      - On 2026-06-01: Balance = 5,000 - 3,000 = 2,000.00
-      - On 2026-07-01: Balance = 2,000 - 3,000 = -1,000.00 (< 2,000.00) -> UNSAFE!
-      - On 2026-08-01: Balance = -1,000 - 3,000 = -4,000.00
-      - amount_safe_to_pay drops from 10,000.00 to exactly 4,000.00 (6,000 min balance - 2,000)
-    """
+    """Projected rent changes an otherwise-safe payment into an unsafe one."""
     req_date = date(2026, 5, 15)
     rent_events = [
         _build_test_event(
@@ -631,9 +592,7 @@ def test_projected_rent_changes_safe_payment_to_unsafe():
     assert safety_with_proj.minimum_balance == Decimal("-4000.00")
     assert safety_with_proj.first_unsafe_date == date(2026, 7, 1)
 
-    # 3. amount_safe_to_pay correctly reflects the conservative headroom
-    # Baseline minimum balance = 6,000.00 (on 2026-08-01).
-    # Headroom = 6,000.00 - 2,000.00 = 4,000.00.
+    # 3. amount_safe_to_pay correctly reflects the conservative headroom (6,000 - 2,000 = 4,000)
     safe_pay = compute_amount_safe_to_pay(
         ledger=ledger,
         request_date=req_date,
@@ -644,18 +603,7 @@ def test_projected_rent_changes_safe_payment_to_unsafe():
 
 
 def test_scheduled_recurring_occurrence_not_duplicated():
-    """A scheduled recurring occurrence already present in the ledger is not duplicated.
-
-    Setup:
-      - Starting balance: 10,000.00
-      - Request date: 2026-05-15
-      - Historical utilities on the 5th of each month (1,000.00).
-      - In ledger.all_events, a scheduled utility event ALREADY exists on 2026-06-05 (1,200.00).
-    Expectation:
-      - Phase 4 MUST NOT generate a duplicate utility occurrence for June 2026.
-      - Projected occurrences are only generated for July (2026-07-05) and August (2026-08-05).
-      - On 2026-06-05, the balance is debited by exactly 1,200.00 (not 1,200 + 1,000 = 2,200).
-    """
+    """A scheduled recurring occurrence already present in the ledger is not duplicated."""
     req_date = date(2026, 5, 15)
     hist_utilities = [
         _build_test_event(
@@ -670,7 +618,6 @@ def test_scheduled_recurring_occurrence_not_duplicated():
         )
         for m in (3, 4, 5)
     ]
-    # Scheduled occurrence already in the ledger for June
     scheduled_june_util = _build_test_event(
         event_id="sched_util_june",
         event_date=date(2026, 6, 5),
@@ -689,39 +636,20 @@ def test_scheduled_recurring_occurrence_not_duplicated():
         events=all_events,
     )
 
-    # Generate future occurrences
     projected = generate_future_recurring_occurrences(ledger, req_date, forecast_days=90)
-    # June is already present in ledger, so only July and August are generated
     assert len(projected) == 2
     proj_dates = [e.settlement_date for e in projected]
     assert proj_dates == [date(2026, 7, 5), date(2026, 8, 5)]
 
-    # Simulate timeline and verify exact daily balance on 2026-06-05
     timeline = simulate_cash_flow(ledger, req_date)
-    # Day before June 5
     assert timeline.daily_balances[date(2026, 6, 4)] == Decimal("10000.00")
-    # On June 5, only the single 1,200.00 scheduled debit is applied: 10,000 - 1,200 = 8,800.00
     assert timeline.daily_balances[date(2026, 6, 5)] == Decimal("8800.00")
-    # On July 5, projected debit of conservative amount (1,200.00, max of recent): 8,800 - 1,200 = 7,600.00
     assert timeline.daily_balances[date(2026, 7, 5)] == Decimal("7600.00")
-    # On August 5: 7,600 - 1,200 = 6,400.00
     assert timeline.daily_balances[date(2026, 8, 5)] == Decimal("6400.00")
 
 
 def test_monthly_cadence_month_end_boundary_february():
-    """Monthly cadence works through a month-end boundary (31st day landing on February's final day).
-
-    Setup:
-      - Request date: 2026-01-15 (2026 is a non-leap year, Feb has 28 days)
-      - Subscription historically charged on the 31st of each month:
-        2025-10-31, 2025-11-30, 2025-12-31.
-    Expectations:
-      - Cadence day is detected as 31.
-      - Projected dates in [2026-01-15, 2026-04-15]:
-        * January 2026: 2026-01-31 (31st)
-        * February 2026: 2026-02-28 (capped to final day of Feb!)
-        * March 2026: 2026-03-31 (31st)
-    """
+    """Monthly cadence works through a month-end boundary (31st day landing on February's final day)."""
     req_date = date(2026, 1, 15)
     sub_events = [
         _build_test_event(
@@ -763,23 +691,11 @@ def test_monthly_cadence_month_end_boundary_february():
 
     projected = generate_future_recurring_occurrences(ledger, req_date, forecast_days=90)
     proj_dates = [e.settlement_date for e in projected]
-
-    # Verify dates across January, February (28 days in 2026), and March
     assert proj_dates == [date(2026, 1, 31), date(2026, 2, 28), date(2026, 3, 31)]
 
 
 def test_recurring_salary_synthesized_by_phase3_not_duplicated():
-    """A recurring salary already synthesized by Phase 3 is not duplicated by Phase 4.
-
-    Setup:
-      - Request date: 2026-05-15
-      - Phase 3 has already populated scheduled salary events on the 15th of June, July, August:
-        sched_sal_user_2026-06-15, sched_sal_user_2026-07-15, sched_sal_user_2026-08-15.
-    Expectation:
-      - generate_future_recurring_occurrences must NOT create duplicate salary occurrences.
-      - During simulation, salary credits apply exactly once on the 15th of each month (+3,000.00),
-        NOT duplicated (+6,000.00).
-    """
+    """A recurring salary already synthesized by Phase 3 is not duplicated by Phase 4."""
     req_date = date(2026, 6, 1)
     salary_events = [
         _build_test_event(
@@ -801,19 +717,266 @@ def test_recurring_salary_synthesized_by_phase3_not_duplicated():
         events=salary_events,
     )
 
-    # 1. generate_future_recurring_occurrences ignores salary credits (Phase 3 manages them)
     projected = generate_future_recurring_occurrences(ledger, req_date, forecast_days=90)
     assert len(projected) == 0
 
-    # 2. Simulate cash flow and check exact balances
     timeline = simulate_cash_flow(ledger, req_date)
-    # Balance before June 15: 5,000.00
     assert timeline.daily_balances[date(2026, 6, 14)] == Decimal("5000.00")
-    # On June 15: exactly one +3,000.00 credit -> 8,000.00 (NOT 11,000.00)
     assert timeline.daily_balances[date(2026, 6, 15)] == Decimal("8000.00")
-    # On July 15: exactly one +3,000.00 credit -> 11,000.00
     assert timeline.daily_balances[date(2026, 7, 15)] == Decimal("11000.00")
-    # On August 15: exactly one +3,000.00 credit -> 14,000.00
     assert timeline.daily_balances[date(2026, 8, 15)] == Decimal("14000.00")
-    # End of horizon (August 30): 14,000.00
     assert timeline.daily_balances[req_date + timedelta(days=90)] == Decimal("14000.00")
+
+
+# ===========================================================================
+# Phase 4 Conservative Variable Essentials Tests (Required by Section 3)
+# ===========================================================================
+
+def test_protected_groceries_create_future_forecast_debits():
+    """Protected groceries with only historical records create future forecast debits.
+
+    Setup:
+      - Start balance: 10,000.00
+      - Minimum balance to keep: 2,000.00
+      - Request date: 2026-05-15
+      - Protected categories: {'groceries', 'rent'}
+      - History of settled weekly groceries (Fridays):
+        2026-04-24: 500.00, 2026-05-01: 500.00, 2026-05-08: 500.00
+      - No future scheduled grocery debits in ledger.
+    Expectation:
+      - Cadence = 7 days.
+      - First future grocery debit falls on 2026-05-15 (500.00).
+      - Subsequent debits on 2026-05-22, 2026-05-29, etc.
+      - Daily balance drops by 500.00 on each of those Fridays.
+    """
+    req_date = date(2026, 5, 15)
+    groc_events = [
+        _build_test_event(
+            event_id="groc_01",
+            event_date=date(2026, 4, 24),
+            settlement_date=date(2026, 4, 24),
+            direction="debit",
+            amount=Decimal("500.00"),
+            category="groceries",
+            status="settled",
+            is_recurring=False,
+            description="Weekly grocery shop",
+        ),
+        _build_test_event(
+            event_id="groc_02",
+            event_date=date(2026, 5, 1),
+            settlement_date=date(2026, 5, 1),
+            direction="debit",
+            amount=Decimal("500.00"),
+            category="groceries",
+            status="settled",
+            is_recurring=False,
+            description="Weekly grocery shop",
+        ),
+        _build_test_event(
+            event_id="groc_03",
+            event_date=date(2026, 5, 8),
+            settlement_date=date(2026, 5, 8),
+            direction="debit",
+            amount=Decimal("500.00"),
+            category="groceries",
+            status="settled",
+            is_recurring=False,
+            description="Weekly grocery shop",
+        ),
+    ]
+    ledger = _build_test_ledger(
+        current_available_balance=Decimal("10000.00"),
+        minimum_balance_to_keep=Decimal("2000.00"),
+        events=groc_events,
+        protected_categories=frozenset({"groceries", "rent"}),
+    )
+
+    proj_essentials = generate_future_variable_essential_occurrences(ledger, req_date, forecast_days=90)
+    assert len(proj_essentials) >= 12
+    assert proj_essentials[0].settlement_date == date(2026, 5, 15)
+    assert proj_essentials[1].settlement_date == date(2026, 5, 22)
+    assert proj_essentials[2].settlement_date == date(2026, 5, 29)
+    assert all(e.normalized_amount == Decimal("500.00") for e in proj_essentials)
+    assert all(e.category == "groceries" for e in proj_essentials)
+
+    timeline = simulate_cash_flow(ledger, req_date)
+    # Day 0 (2026-05-15): 10,000 - 500 = 9,500.00
+    assert timeline.daily_balances[date(2026, 5, 15)] == Decimal("9500.00")
+    # Day 6 (2026-05-21): 9,500.00
+    assert timeline.daily_balances[date(2026, 5, 21)] == Decimal("9500.00")
+    # Day 7 (2026-05-22): 9,500 - 500 = 9,000.00
+    assert timeline.daily_balances[date(2026, 5, 22)] == Decimal("9000.00")
+    # Day 14 (2026-05-29): 9,000 - 500 = 8,500.00
+    assert timeline.daily_balances[date(2026, 5, 29)] == Decimal("8500.00")
+
+
+def test_grocery_debits_turn_otherwise_safe_payment_unsafe():
+    """Those grocery debits turn an otherwise-safe payment into unsafe.
+
+    Setup:
+      - Start balance: 10,000.00
+      - Minimum to keep: 2,000.00
+      - Request date: 2026-05-15
+      - Proposed payment: 7,500.00 on 2026-05-15
+      - Groceries: 500.00 weekly on Fridays (settled 2026-04-24, 2026-05-01, 2026-05-08)
+    Comparison:
+      - Without essential variable forecasting:
+        Balance after payment = 10,000 - 7,500 = 2,500.00 >= 2,000.00 (falsely reported SAFE)
+      - With essential variable forecasting:
+        2026-05-15: Balance = 10,000 - 7,500 - 500 = 2,000.00
+        2026-05-22: Balance = 2,000 - 500 = 1,500.00 (< 2,000.00) -> UNSAFE!
+      - amount_safe_to_pay drops to 1,500.00 (min balance across 13 weeks = 3,500 - 2,000 = 1,500)
+    """
+    req_date = date(2026, 5, 15)
+    groc_events = [
+        _build_test_event(
+            event_id=f"groc_{m}",
+            event_date=d,
+            settlement_date=d,
+            direction="debit",
+            amount=Decimal("500.00"),
+            category="groceries",
+            status="settled",
+            is_recurring=False,
+        )
+        for m, d in enumerate([date(2026, 4, 24), date(2026, 5, 1), date(2026, 5, 8)])
+    ]
+    ledger = _build_test_ledger(
+        current_available_balance=Decimal("10000.00"),
+        minimum_balance_to_keep=Decimal("2000.00"),
+        events=groc_events,
+        protected_categories=frozenset({"groceries"}),
+    )
+
+    # 1. Without variable essentials forecasting: falsely reported SAFE
+    res_without = evaluate_schedule_safety(
+        ledger=ledger,
+        request_date=req_date,
+        payments=[(req_date, Decimal("7500.00"))],
+        include_projected_essentials=False,
+    )
+    assert res_without.is_safe is True
+    assert res_without.minimum_balance == Decimal("2500.00")
+
+    # 2. With variable essentials forecasting: correctly identified as UNSAFE on 2026-05-22
+    res_with = evaluate_schedule_safety(
+        ledger=ledger,
+        request_date=req_date,
+        payments=[(req_date, Decimal("7500.00"))],
+        include_projected_essentials=True,
+    )
+    assert res_with.is_safe is False
+    assert res_with.first_unsafe_date == date(2026, 5, 22)
+    assert res_with.minimum_balance < Decimal("2000.00")
+
+    # 3. amount_safe_to_pay drops from 7,500.00 to 1,500.00
+    safe_pay = compute_amount_safe_to_pay(
+        ledger=ledger,
+        request_date=req_date,
+        requested_amount=Decimal("7500.00"),
+        include_projected_essentials=True,
+    )
+    # Total grocery spend across 90 days: 13 x 500 = 6,500.00
+    # Minimum balance = 10,000 - 6,500 = 3,500.00
+    # Headroom = 3,500 - 2,000 = 1,500.00
+    assert safe_pay == Decimal("1500.00")
+
+
+def test_frequent_unprotected_dining_not_forecast():
+    """Frequent but unprotected/optional dining is not forecast.
+
+    Setup:
+      - User has frequent settled dining events every 7 days (2026-04-24, 2026-05-01, 2026-05-08).
+      - User profile's expense_categories_to_protect does NOT include dining (only {'rent', 'groceries'}).
+    Expectation:
+      - generate_future_variable_essential_occurrences outputs ZERO dining occurrences.
+      - Normal simulation does not deduct future dining spend.
+    """
+    req_date = date(2026, 5, 15)
+    dining_events = [
+        _build_test_event(
+            event_id=f"dining_{m}",
+            event_date=d,
+            settlement_date=d,
+            direction="debit",
+            amount=Decimal("300.00"),
+            category="dining",
+            status="settled",
+            is_recurring=False,
+        )
+        for m, d in enumerate([date(2026, 4, 24), date(2026, 5, 1), date(2026, 5, 8)])
+    ]
+    ledger = _build_test_ledger(
+        current_available_balance=Decimal("10000.00"),
+        minimum_balance_to_keep=Decimal("2000.00"),
+        events=dining_events,
+        protected_categories=frozenset({"rent", "groceries"}),
+    )
+
+    proj_essentials = generate_future_variable_essential_occurrences(ledger, req_date, forecast_days=90)
+    assert len(proj_essentials) == 0
+    assert not any(e.category == "dining" for e in proj_essentials)
+
+    timeline = simulate_cash_flow(ledger, req_date)
+    # Daily balances remain 10,000.00 since dining is optional and not protected
+    assert timeline.minimum_balance == Decimal("10000.00")
+
+
+def test_pending_or_scheduled_essential_debit_not_duplicated():
+    """A known pending or scheduled essential debit is not duplicated.
+
+    Setup:
+      - Request date: 2026-05-15 (Friday)
+      - Historical weekly groceries on Fridays (2026-04-24, 2026-05-01, 2026-05-08) for 500.00
+      - Next expected occurrence is Friday 2026-05-15.
+      - In ledger.all_events, a pending grocery debit ALREADY exists settling on 2026-05-15 for 550.00.
+    Expectation:
+      - The pending debit on 2026-05-15 is preserved.
+      - Phase 4 MUST NOT create a duplicate grocery debit on 2026-05-15.
+      - The first projected grocery debit starts on 2026-05-22.
+      - On 2026-05-15, the balance is debited by exactly 550.00 once (not 550 + 500 = 1050).
+    """
+    req_date = date(2026, 5, 15)
+    hist_groceries = [
+        _build_test_event(
+            event_id=f"groc_hist_{m}",
+            event_date=d,
+            settlement_date=d,
+            direction="debit",
+            amount=Decimal("500.00"),
+            category="groceries",
+            status="settled",
+            is_recurring=False,
+        )
+        for m, d in enumerate([date(2026, 4, 24), date(2026, 5, 1), date(2026, 5, 8)])
+    ]
+    pending_grocery = _build_test_event(
+        event_id="pending_groc_01",
+        event_date=date(2026, 5, 10),
+        settlement_date=date(2026, 5, 15),
+        direction="debit",
+        amount=Decimal("550.00"),
+        category="groceries",
+        status="pending",
+        is_recurring=False,
+        description="Pending supermarket debit",
+    )
+    all_events = hist_groceries + [pending_grocery]
+    ledger = _build_test_ledger(
+        current_available_balance=Decimal("10000.00"),
+        minimum_balance_to_keep=Decimal("2000.00"),
+        events=all_events,
+        protected_categories=frozenset({"groceries"}),
+    )
+
+    proj_essentials = generate_future_variable_essential_occurrences(ledger, req_date, forecast_days=90)
+    # The occurrence on 2026-05-15 is skipped because of the pending debit
+    assert proj_essentials[0].settlement_date == date(2026, 5, 22)
+    assert not any(e.settlement_date == date(2026, 5, 15) for e in proj_essentials)
+
+    timeline = simulate_cash_flow(ledger, req_date)
+    # On 2026-05-15: only the 550.00 pending debit applies -> 10,000 - 550 = 9,450.00
+    assert timeline.daily_balances[date(2026, 5, 15)] == Decimal("9450.00")
+    # On 2026-05-22: first projected grocery debit of 500.00 -> 9,450 - 500 = 8,950.00
+    assert timeline.daily_balances[date(2026, 5, 22)] == Decimal("8950.00")

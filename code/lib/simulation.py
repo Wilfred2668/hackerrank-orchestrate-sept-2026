@@ -3,11 +3,12 @@ Deterministic 90-Day Cash-Flow Simulation and Affordability Search (Phase 4).
 
 Consumes:
   1. ReconciledLedger (from Phase 3 reconciliation)
-  2. FinancialProfile (or ledger.minimum_balance_to_keep / current_available_balance)
+  2. FinancialProfile (or ledger.minimum_balance_to_keep / current_available_balance / protected_categories)
   3. Request (or request_date, requested_amount)
 
 Provides:
   - generate_future_recurring_occurrences: Generates future recurring debits across [request_date, request_date + 90 days]
+  - generate_future_variable_essential_occurrences: Generates future conservative essential variable debits (e.g. groceries, transport)
   - simulate_cash_flow: Generates daily balance timelines over [request_date, request_date + 90 days]
   - evaluate_schedule_safety: Tests whether a proposed payment schedule maintains minimum balance
   - compute_amount_safe_to_pay: Binary search for largest safe one-time payment on request_date
@@ -24,7 +25,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import date, timedelta
 from decimal import Decimal, ROUND_FLOOR
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import AbstractSet, Dict, List, Optional, Sequence, Set, Tuple
 
 from .models import FinancialProfile, Request
 from .reconciliation import ReconciledEvent, ReconciledLedger
@@ -156,14 +157,6 @@ def generate_future_recurring_occurrences(
 
     Salary streams (direction == 'credit' and category == 'salary') are managed by Phase 3's
     reconciliation synthesis and are never duplicated here.
-
-    Args:
-        ledger: ReconciledLedger containing recurring_events and existing scheduled events.
-        request_date: Start of the simulation horizon.
-        forecast_days: Horizon length in days (default: 90).
-
-    Returns:
-        List of newly projected ReconciledEvent instances with status='scheduled'.
     """
     start_date = request_date
     end_date = request_date + timedelta(days=forecast_days)
@@ -248,6 +241,142 @@ def generate_future_recurring_occurrences(
 
 
 # ---------------------------------------------------------------------------
+# Essential Variable Spending Forecasting
+# ---------------------------------------------------------------------------
+
+def generate_future_variable_essential_occurrences(
+    ledger: ReconciledLedger,
+    request_date: date,
+    protected_categories: Optional[AbstractSet[str]] = None,
+    forecast_days: int = 90,
+) -> List[ReconciledEvent]:
+    """Generate future conservative variable essential debits across [request_date, request_date + forecast_days].
+
+    Identifies forecastable variable essentials:
+      - Considers historical debit events whose category is in `protected_categories`
+        (or `ledger.protected_categories`).
+      - Only includes essentials not already managed as fixed monthly recurring commitments
+        (e.g. groceries, transport).
+      - Ignores optional/unprotected categories (e.g. dining, entertainment), even if frequent.
+      - Requires at least 3 historical settled occurrences to support a genuine cadence.
+
+    Cadence and Amount Rules:
+      1. Cadence (interval in days) is the statistical mode of positive intervals between
+         consecutive settled historical dates.
+      2. Conservative amount is the maximum normalized amount among the most recent settled
+         occurrences (up to the last 8).
+      3. Occurrence timeline begins at `last_settled_date + cadence_days`, advanced to `>= request_date`.
+      4. De-duplication: Skips any candidate date where `ledger.all_events` already contains a
+         pending or scheduled debit for that category within `cadence_days // 2` days.
+
+    Args:
+        ledger: ReconciledLedger containing user's financial state.
+        request_date: Start of forecast horizon.
+        protected_categories: Optional set of categories to protect (defaults to ledger.protected_categories).
+        forecast_days: Horizon length in days (default: 90).
+
+    Returns:
+        List of newly projected ReconciledEvent instances for variable essentials.
+    """
+    start_date = request_date
+    end_date = request_date + timedelta(days=forecast_days)
+
+    target_protected: AbstractSet[str] = (
+        protected_categories
+        if protected_categories is not None
+        else (ledger.protected_categories or frozenset())
+    )
+    if not target_protected:
+        return []
+
+    # Exclude categories already managed as fixed recurring commitments
+    recurring_cats = set(e.category for e in ledger.recurring_events)
+
+    # Group settled historical debits on or before request_date
+    historical_debits_by_cat: Dict[str, List[ReconciledEvent]] = defaultdict(list)
+    for e in ledger.all_events:
+        eff_d = e.settlement_date if e.settlement_date is not None else e.event_date
+        if (
+            e.direction == "debit"
+            and e.status == "settled"
+            and eff_d <= start_date
+            and e.category in target_protected
+            and e.category not in recurring_cats
+        ):
+            historical_debits_by_cat[e.category].append(e)
+
+    projected_events: List[ReconciledEvent] = []
+
+    for cat, events_in_cat in historical_debits_by_cat.items():
+        # Require at least 3 historical settled events to support a cadence
+        if len(events_in_cat) < 3:
+            continue
+
+        cat_events = sorted(events_in_cat, key=lambda x: x.event_date)
+        dates = sorted(set(e.event_date for e in cat_events))
+        if len(dates) < 3:
+            continue
+
+        diffs = [(dates[i + 1] - dates[i]).days for i in range(len(dates) - 1) if (dates[i + 1] - dates[i]).days > 0]
+        if not diffs:
+            continue
+
+        cadence_days = Counter(diffs).most_common(1)[0][0]
+        if cadence_days <= 0:
+            cadence_days = 7
+
+        # Conservative amount: peak normalized amount among recent settled occurrences
+        recent_events = cat_events[-8:]
+        conservative_amt = max(e.normalized_amount for e in recent_events)
+        latest_event = cat_events[-1]
+
+        # Anchor date: advance from last settled date in steps of cadence_days
+        cand_date = dates[-1] + timedelta(days=cadence_days)
+        while cand_date < start_date:
+            cand_date += timedelta(days=cadence_days)
+
+        dedup_window_days = max(1, cadence_days // 2)
+
+        while cand_date <= end_date:
+            # De-duplication: check if ledger already has a pending or scheduled debit in window
+            already_exists = any(
+                e.category == cat
+                and e.direction == "debit"
+                and (e.settlement_date or e.event_date) >= start_date
+                and abs(((e.settlement_date or e.event_date) - cand_date).days) <= dedup_window_days
+                for e in ledger.all_events
+            )
+
+            if not already_exists:
+                proj_ev = ReconciledEvent(
+                    event_id=f"proj_ess_{cat}_{cand_date.isoformat()}",
+                    user_id=ledger.user_id,
+                    event_type=latest_event.event_type,
+                    description=f"Projected essential {cat}",
+                    category=cat,
+                    direction="debit",
+                    original_amount=conservative_amt,
+                    original_currency=ledger.home_currency,
+                    normalized_amount=conservative_amt,
+                    home_currency=ledger.home_currency,
+                    event_date=cand_date,
+                    settlement_date=cand_date,
+                    status="scheduled",
+                    flexibility="fixed",
+                    minimum_allowed_amount=None,
+                    is_recurring=False,
+                    is_protected=True,
+                    is_reducible=False,
+                    is_stoppable=False,
+                )
+                projected_events.append(proj_ev)
+
+            cand_date += timedelta(days=cadence_days)
+
+    return projected_events
+
+
+# ---------------------------------------------------------------------------
 # 1. Daily 90-Day Cash-Flow Simulation
 # ---------------------------------------------------------------------------
 
@@ -257,8 +386,10 @@ def simulate_cash_flow(
     payments: Optional[Sequence[Tuple[date, Decimal]]] = None,
     extra_events: Optional[Sequence[ReconciledEvent]] = None,
     excluded_event_ids: Optional[Set[str]] = None,
+    protected_categories: Optional[AbstractSet[str]] = None,
     forecast_days: int = 90,
     include_projected_recurring: bool = True,
+    include_projected_essentials: bool = True,
 ) -> SimulationTimeline:
     """Run a deterministic daily cash-flow simulation over [request_date, request_date + forecast_days].
 
@@ -266,6 +397,8 @@ def simulate_cash_flow(
       - Starts at `current_available_balance` on `request_date`.
       - Incorporates conservative projected occurrences for recurring commitments
         (rent, utilities, subscriptions, debt repayments, etc.).
+      - Incorporates conservative projected variable essentials (groceries, transport)
+        when listed in protected_categories.
       - Applies each event on its `settlement_date` (or `event_date` if settlement_date is None).
       - Credits increase balance; debits decrease balance.
       - Pending debits remain reserved and reduce projected balance on their settlement date.
@@ -278,8 +411,10 @@ def simulate_cash_flow(
         payments: Optional sequence of (payment_date, amount) deductions.
         extra_events: Optional additional reconciled events to incorporate.
         excluded_event_ids: Optional set of event_ids to exclude (e.g. stopped expenses).
+        protected_categories: Optional set of categories to protect (defaults to ledger.protected_categories).
         forecast_days: Length of simulation window in days (default: 90).
         include_projected_recurring: If True, forecasts future recurring commitments.
+        include_projected_essentials: If True, forecasts future protected variable essentials.
 
     Returns:
         SimulationTimeline with daily balances and minimum projected balance.
@@ -295,6 +430,15 @@ def simulate_cash_flow(
             forecast_days=forecast_days,
         )
         events_to_process.extend(projected)
+
+    if include_projected_essentials:
+        proj_essentials = generate_future_variable_essential_occurrences(
+            ledger=ledger,
+            request_date=request_date,
+            protected_categories=protected_categories,
+            forecast_days=forecast_days,
+        )
+        events_to_process.extend(proj_essentials)
 
     if extra_events:
         events_to_process.extend(extra_events)
@@ -358,8 +502,10 @@ def evaluate_schedule_safety(
     minimum_balance_to_keep: Optional[Decimal] = None,
     extra_events: Optional[Sequence[ReconciledEvent]] = None,
     excluded_event_ids: Optional[Set[str]] = None,
+    protected_categories: Optional[AbstractSet[str]] = None,
     forecast_days: int = 90,
     include_projected_recurring: bool = True,
+    include_projected_essentials: bool = True,
 ) -> SafetyResult:
     """Determine whether a proposed payment schedule is safe.
 
@@ -374,8 +520,10 @@ def evaluate_schedule_safety(
         minimum_balance_to_keep: Balance threshold to maintain (defaults to ledger's).
         extra_events: Optional additional events to incorporate.
         excluded_event_ids: Optional event_ids to exclude.
+        protected_categories: Optional set of categories to protect.
         forecast_days: Horizon in days (default: 90).
         include_projected_recurring: If True, forecasts future recurring commitments.
+        include_projected_essentials: If True, forecasts future protected variable essentials.
 
     Returns:
         SafetyResult with is_safe, minimum_balance, and first_unsafe_date if unsafe.
@@ -409,8 +557,10 @@ def evaluate_schedule_safety(
         payments=payments,
         extra_events=extra_events,
         excluded_event_ids=excluded_event_ids,
+        protected_categories=protected_categories,
         forecast_days=forecast_days,
         include_projected_recurring=include_projected_recurring,
+        include_projected_essentials=include_projected_essentials,
     )
 
     # Check for violations in chronological order
@@ -448,9 +598,11 @@ def compute_amount_safe_to_pay(
     request_date: date,
     requested_amount: Decimal,
     minimum_balance_to_keep: Optional[Decimal] = None,
+    protected_categories: Optional[AbstractSet[str]] = None,
     step: Decimal = Decimal("0.01"),
     forecast_days: int = 90,
     include_projected_recurring: bool = True,
+    include_projected_essentials: bool = True,
 ) -> Decimal:
     """Compute the largest safe one-time payment on request_date using binary search.
 
@@ -465,9 +617,11 @@ def compute_amount_safe_to_pay(
         request_date: Date of the one-time payment evaluation.
         requested_amount: Full purchase/payment amount requested.
         minimum_balance_to_keep: Balance threshold (defaults to ledger's).
+        protected_categories: Optional set of categories to protect.
         step: Smallest currency unit for search granularity (default: Decimal("0.01")).
         forecast_days: Horizon in days (default: 90).
         include_projected_recurring: If True, forecasts future recurring commitments.
+        include_projected_essentials: If True, forecasts future protected variable essentials.
 
     Returns:
         The largest safe payment amount as a Decimal.
@@ -486,8 +640,10 @@ def compute_amount_safe_to_pay(
         ledger=ledger,
         request_date=request_date,
         payments=None,
+        protected_categories=protected_categories,
         forecast_days=forecast_days,
         include_projected_recurring=include_projected_recurring,
+        include_projected_essentials=include_projected_essentials,
     )
 
     max_headroom = baseline.minimum_balance - target_min
@@ -509,8 +665,10 @@ def compute_amount_safe_to_pay(
             request_date=request_date,
             payments=[(request_date, mid_amount)],
             minimum_balance_to_keep=target_min,
+            protected_categories=protected_categories,
             forecast_days=forecast_days,
             include_projected_recurring=include_projected_recurring,
+            include_projected_essentials=include_projected_essentials,
         )
         if safety.is_safe:
             best_step = mid
@@ -534,8 +692,10 @@ def find_earliest_date_for_full_payment(
     minimum_balance_to_keep: Optional[Decimal] = None,
     extra_events: Optional[Sequence[ReconciledEvent]] = None,
     excluded_event_ids: Optional[Set[str]] = None,
+    protected_categories: Optional[AbstractSet[str]] = None,
     forecast_days: int = 90,
     include_projected_recurring: bool = True,
+    include_projected_essentials: bool = True,
 ) -> Optional[date]:
     """Find the earliest date in [request_date, request_date + forecast_days]
     on which one full payment of requested_amount is safe.
@@ -553,8 +713,10 @@ def find_earliest_date_for_full_payment(
         minimum_balance_to_keep: Balance threshold (defaults to ledger's).
         extra_events: Optional additional events.
         excluded_event_ids: Optional event_ids to exclude.
+        protected_categories: Optional set of categories to protect.
         forecast_days: Horizon in days (default: 90).
         include_projected_recurring: If True, forecasts future recurring commitments.
+        include_projected_essentials: If True, forecasts future protected variable essentials.
 
     Returns:
         Earliest safe payment date, or None.
@@ -569,8 +731,10 @@ def find_earliest_date_for_full_payment(
             minimum_balance_to_keep=minimum_balance_to_keep,
             extra_events=extra_events,
             excluded_event_ids=excluded_event_ids,
+            protected_categories=protected_categories,
             forecast_days=forecast_days,
             include_projected_recurring=include_projected_recurring,
+            include_projected_essentials=include_projected_essentials,
         )
         if res.is_safe:
             return candidate_date

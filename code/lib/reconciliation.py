@@ -109,6 +109,7 @@ class ReconciledLedger:
     matched_deltas_count: int        # total active deltas matched (user_general + specific)
     unmatched_deltas_count: int
     no_change_deltas_count: int = 0  # confirm_no_change deltas
+    protected_categories: Optional[frozenset[str]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -809,6 +810,7 @@ def reconcile_user_ledger(
         matched_deltas_count=matched_deltas_count,
         unmatched_deltas_count=unmatched_deltas_count,
         no_change_deltas_count=no_change_deltas_count,
+        protected_categories=profile.expense_categories_to_protect,
     )
 
 
