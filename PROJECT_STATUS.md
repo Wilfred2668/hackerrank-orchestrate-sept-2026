@@ -192,17 +192,30 @@ does not guarantee that only validated rows are serialized. Replace the public
 boolean with an internal unforgeable factory path and add a regression test for
 the explicit boolean-bypass attempt.
 
+## Phase 6 factory review — 2026-09-12 (`1425a8d`)
+
+Still not approved. `ValidatedDecision(...)` is now blocked, but the public
+`ValidatedDecision._create_validated(raw_decision)` class method remains a
+direct minting route, and `object.__new__(ValidatedDecision)` followed by a
+first `_decision` assignment also produces an object accepted by serializers,
+which only check `isinstance`. The purported validation-only factory is
+therefore still forgeable. The serializer needs an internal provenance registry
+or equivalent authenticity check, plus regression coverage of both bypasses.
+
 ### Resolution:
-- Removed public boolean `_validated` parameter from `ValidatedDecision`.
-- Forbade direct public construction: `ValidatedDecision.__new__` and `__init__` unconditionally raise `OutputValidationError`, rejecting all public constructor invocations including `_validated=True`.
-- Replaced instantiation path with internal factory `ValidatedDecision._create_validated(decision)` called solely by `validate_decision_result` after all validation checks succeed.
-- Maintained immutability and property delegation on `ValidatedDecision`.
-- Preserved public serializer requirement (`isinstance(target, ValidatedDecision)`), ensuring raw decisions cannot be serialized.
+- Completely removed `_create_validated` from `ValidatedDecision`.
+- Maintained strict blocking on direct construction: `ValidatedDecision.__new__` and `__init__` unconditionally raise `OutputValidationError`.
+- Maintained immutability via `ValidatedDecision.__setattr__` raising `AttributeError`.
+- Added internal authenticity and provenance tracking:
+  - Private module-level token `_AUTHENTIC_PROVENANCE_TOKEN` and strong reference registry `_VALIDATED_DECISION_REGISTRY` mapping `id(instance) -> instance`.
+  - Only `_mint_and_register_validated_decision` (called exclusively by `validate_decision_result` after all validation checks pass) registers a wrapper and attaches the internal provenance token.
+  - Holding strong references in `_VALIDATED_DECISION_REGISTRY` safely prevents memory address identity reuse while the instance lives in the registry, and `_is_authentically_validated` verifies both provenance token and `registered is target` pointer identity.
+- Updated all public serializers (`serialize_decision_row`, `serialize_decision_csv_line`, `serialize_decisions_to_csv`) to require both `isinstance(target, ValidatedDecision)` and `_is_authentically_validated(target)`, raising `TypeError` for forged, unauthenticated, or manually allocated wrappers.
 - Added regression tests in `code/tests/test_validation.py` verifying:
-  1. `ValidatedDecision(raw_decision)` raises `OutputValidationError`.
-  2. `ValidatedDecision(raw_decision, _validated=True)` raises `OutputValidationError`.
-  3. `ValidatedDecision.__new__(ValidatedDecision)` raises `OutputValidationError`.
-  4. An invalid raw decision cannot be wrapped via any public constructor route and cannot be serialized.
-  5. A wrapper returned by `validate_decision_result` still serializes normally across all serializer functions.
+  1. `ValidatedDecision._create_validated` no longer exists on the class (`assert not hasattr(...)`).
+  2. Direct construction (`ValidatedDecision(raw)`, `_validated=True`, `__new__`) raises `OutputValidationError`.
+  3. `object.__new__(ValidatedDecision)` plus manual injection fails `__setattr__`, and when bypassed via `object.__setattr__`, is rejected by all serializers with `TypeError`.
+  4. Raw invalid decision cannot be wrapped or serialized.
+  5. Genuine `ValidatedDecision` returned by `validate_decision_result` is accepted and serializes normally.
 - All tests remain unexecuted per project instructions.
 

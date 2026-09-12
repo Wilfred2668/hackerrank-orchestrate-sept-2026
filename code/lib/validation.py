@@ -78,8 +78,12 @@ OUTPUT_COLUMNS: Tuple[str, ...] = (
 
 
 # ---------------------------------------------------------------------------
-# Validated Decision Wrapper
+# Validated Decision Wrapper & Provenance Registry
 # ---------------------------------------------------------------------------
+
+_AUTHENTIC_PROVENANCE_TOKEN = object()
+_VALIDATED_DECISION_REGISTRY: Dict[int, "ValidatedDecision"] = {}
+
 
 class ValidatedDecision:
     """A decision result that has passed fail-closed validation against request, profile, and ledger.
@@ -87,6 +91,7 @@ class ValidatedDecision:
     Instances can only be minted internally by validate_decision_result.
     """
     _decision: DecisionResult
+    _provenance_token: object
 
     def __new__(cls, *args, **kwargs):
         raise OutputValidationError(
@@ -100,17 +105,8 @@ class ValidatedDecision:
             "Use validate_decision_result."
         )
 
-    @classmethod
-    def _create_validated(cls, decision: DecisionResult) -> ValidatedDecision:
-        """Internal factory invoked exclusively by validate_decision_result."""
-        instance = object.__new__(cls)
-        object.__setattr__(instance, "_decision", decision)
-        return instance
-
     def __setattr__(self, key: str, value: object) -> None:
-        if hasattr(self, "_decision"):
-            raise AttributeError("ValidatedDecision is immutable.")
-        super().__setattr__(key, value)
+        raise AttributeError("ValidatedDecision is immutable.")
 
     @property
     def decision(self) -> DecisionResult:
@@ -157,6 +153,25 @@ class ValidatedDecision:
 
     def __repr__(self) -> str:
         return f"ValidatedDecision(decision={self._decision!r})"
+
+
+def _mint_and_register_validated_decision(decision: DecisionResult) -> ValidatedDecision:
+    """Internal factory invoked exclusively by validate_decision_result."""
+    instance = object.__new__(ValidatedDecision)
+    object.__setattr__(instance, "_decision", decision)
+    object.__setattr__(instance, "_provenance_token", _AUTHENTIC_PROVENANCE_TOKEN)
+    _VALIDATED_DECISION_REGISTRY[id(instance)] = instance
+    return instance
+
+
+def _is_authentically_validated(target: object) -> bool:
+    """Verify that target is a ValidatedDecision and genuinely registered in the internal registry."""
+    if not isinstance(target, ValidatedDecision):
+        return False
+    if getattr(target, "_provenance_token", None) is not _AUTHENTIC_PROVENANCE_TOKEN:
+        return False
+    registered = _VALIDATED_DECISION_REGISTRY.get(id(target))
+    return registered is target
 
 
 # ---------------------------------------------------------------------------
@@ -632,7 +647,7 @@ def validate_decision_result(
                 f"on {safety.first_unsafe_date}: {safety.unsafe_reason}."
             )
 
-    return ValidatedDecision._create_validated(decision)
+    return _mint_and_register_validated_decision(decision)
 
 
 # ---------------------------------------------------------------------------
@@ -642,12 +657,13 @@ def validate_decision_result(
 def serialize_decision_row(target: ValidatedDecision) -> List[str]:
     """Serialize a ValidatedDecision into an exact 8-element row in specification column order.
 
-    Raises TypeError if an unvalidated DecisionResult or arbitrary object is passed.
+    Raises TypeError if an unvalidated DecisionResult, arbitrary object, or unauthenticated wrapper is passed.
     """
-    if not isinstance(target, ValidatedDecision):
+    if not isinstance(target, ValidatedDecision) or not _is_authentically_validated(target):
         raise TypeError(
-            f"Public serializer requires a ValidatedDecision produced by validate_decision_result, "
-            f"got {type(target).__name__}. Raw DecisionResult cannot be serialized directly."
+            f"Public serializer requires an authentically validated ValidatedDecision produced by "
+            f"validate_decision_result, got {type(target).__name__}. Unauthenticated or manually "
+            f"allocated wrappers cannot be serialized."
         )
     return [
         target.request_id,
@@ -664,12 +680,13 @@ def serialize_decision_row(target: ValidatedDecision) -> List[str]:
 def serialize_decision_csv_line(target: ValidatedDecision) -> str:
     """Serialize a single ValidatedDecision into a valid RFC-4180 CSV line with LF newline.
 
-    Raises TypeError if an unvalidated DecisionResult or arbitrary object is passed.
+    Raises TypeError if an unvalidated DecisionResult, arbitrary object, or unauthenticated wrapper is passed.
     """
-    if not isinstance(target, ValidatedDecision):
+    if not isinstance(target, ValidatedDecision) or not _is_authentically_validated(target):
         raise TypeError(
-            f"Public serializer requires a ValidatedDecision produced by validate_decision_result, "
-            f"got {type(target).__name__}. Raw DecisionResult cannot be serialized directly."
+            f"Public serializer requires an authentically validated ValidatedDecision produced by "
+            f"validate_decision_result, got {type(target).__name__}. Unauthenticated or manually "
+            f"allocated wrappers cannot be serialized."
         )
     output = io.StringIO()
     writer = csv.writer(output, lineterminator="\n")
@@ -685,13 +702,14 @@ def serialize_decisions_to_csv(
 
     If output_path is provided, writes the content to that path.
     Returns the serialized CSV text string.
-    Raises TypeError if any item is not a ValidatedDecision.
+    Raises TypeError if any item is not an authentically validated ValidatedDecision.
     """
     for i, item in enumerate(decisions):
-        if not isinstance(item, ValidatedDecision):
+        if not isinstance(item, ValidatedDecision) or not _is_authentically_validated(item):
             raise TypeError(
-                f"Public serializer requires ValidatedDecision objects produced by validate_decision_result, "
-                f"got {type(item).__name__} at index {i}. Raw DecisionResult cannot be serialized directly."
+                f"Public serializer requires authentically validated ValidatedDecision objects produced by "
+                f"validate_decision_result, got {type(item).__name__} at index {i}. "
+                f"Unauthenticated or manually allocated wrappers cannot be serialized."
             )
 
     output = io.StringIO()

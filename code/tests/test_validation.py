@@ -515,20 +515,20 @@ def test_raw_decision_result_cannot_be_serialized():
     )
 
     # serialize_decision_row rejects raw DecisionResult
-    with pytest.raises(TypeError, match="Public serializer requires a ValidatedDecision"):
+    with pytest.raises(TypeError, match="Public serializer requires an authentically validated ValidatedDecision"):
         serialize_decision_row(raw_decision)  # type: ignore[arg-type]
 
     # serialize_decision_csv_line rejects raw DecisionResult
-    with pytest.raises(TypeError, match="Public serializer requires a ValidatedDecision"):
+    with pytest.raises(TypeError, match="Public serializer requires an authentically validated ValidatedDecision"):
         serialize_decision_csv_line(raw_decision)  # type: ignore[arg-type]
 
     # serialize_decisions_to_csv rejects sequence containing raw DecisionResult
-    with pytest.raises(TypeError, match="Public serializer requires ValidatedDecision objects"):
+    with pytest.raises(TypeError, match="Public serializer requires authentically validated ValidatedDecision objects"):
         serialize_decisions_to_csv([raw_decision])  # type: ignore[list-item]
 
 
 def test_validated_decision_cannot_be_instantiated_directly():
-    """ValidatedDecision cannot be instantiated through any public constructor route."""
+    """ValidatedDecision cannot be instantiated through any public constructor route, and _create_validated does not exist."""
     raw_decision = DecisionResult(
         request_id="req_001",
         amount_safe_to_pay=Decimal("1000.00"),
@@ -540,15 +540,19 @@ def test_validated_decision_cannot_be_instantiated_directly():
         decision_explanation="Raw decision.",
     )
 
-    # 1. Normal constructor call raises OutputValidationError
+    # 1. _create_validated is completely removed from ValidatedDecision
+    assert not hasattr(ValidatedDecision, "_create_validated")
+    assert getattr(ValidatedDecision, "_create_validated", None) is None
+
+    # 2. Normal constructor call raises OutputValidationError
     with pytest.raises(OutputValidationError, match="cannot be instantiated directly"):
         ValidatedDecision(raw_decision)
 
-    # 2. Constructor call with _validated=True also raises OutputValidationError
+    # 3. Constructor call with _validated=True also raises OutputValidationError
     with pytest.raises(OutputValidationError, match="cannot be instantiated directly"):
         ValidatedDecision(raw_decision, _validated=True)  # type: ignore[call-arg]
 
-    # 3. Direct __new__ call also raises OutputValidationError
+    # 4. Direct __new__ call also raises OutputValidationError
     with pytest.raises(OutputValidationError, match="cannot be instantiated directly"):
         ValidatedDecision.__new__(ValidatedDecision)
 
@@ -574,14 +578,47 @@ def test_invalid_raw_decision_cannot_be_wrapped_or_serialized():
         ValidatedDecision(raw_invalid, _validated=True)  # type: ignore[call-arg]
 
     # Cannot pass raw decision to serializers
-    with pytest.raises(TypeError, match="Public serializer requires a ValidatedDecision"):
+    with pytest.raises(TypeError, match="Public serializer requires an authentically validated ValidatedDecision"):
         serialize_decision_row(raw_invalid)  # type: ignore[arg-type]
 
-    with pytest.raises(TypeError, match="Public serializer requires a ValidatedDecision"):
+    with pytest.raises(TypeError, match="Public serializer requires an authentically validated ValidatedDecision"):
         serialize_decision_csv_line(raw_invalid)  # type: ignore[arg-type]
 
-    with pytest.raises(TypeError, match="Public serializer requires ValidatedDecision"):
+    with pytest.raises(TypeError, match="Public serializer requires authentically validated ValidatedDecision"):
         serialize_decisions_to_csv([raw_invalid])  # type: ignore[list-item]
+
+
+def test_manually_allocated_injected_wrapper_rejected_by_serializers():
+    """object.__new__(ValidatedDecision) plus an injected _decision is rejected by all serializers."""
+    raw_decision = DecisionResult(
+        request_id="req_forged",
+        amount_safe_to_pay=Decimal("1000.00"),
+        affordability_status="affordable_now",
+        recommended_payment_method="full_payment",
+        payment_plan="2026-05-01:1000",
+        earliest_date_for_full_payment=date(2026, 5, 1),
+        spending_changes_needed="none",
+        decision_explanation="Forged decision.",
+    )
+
+    # 1. Direct assignment fails due to immutability
+    forged = object.__new__(ValidatedDecision)
+    with pytest.raises(AttributeError, match="immutable"):
+        forged._decision = raw_decision
+
+    # 2. Bypassing __setattr__ via object.__setattr__ creates an unauthenticated wrapper
+    object.__setattr__(forged, "_decision", raw_decision)
+    assert isinstance(forged, ValidatedDecision)
+
+    # 3. All serializers reject the unauthenticated/forged wrapper with TypeError
+    with pytest.raises(TypeError, match="Public serializer requires an authentically validated ValidatedDecision"):
+        serialize_decision_row(forged)
+
+    with pytest.raises(TypeError, match="Public serializer requires an authentically validated ValidatedDecision"):
+        serialize_decision_csv_line(forged)
+
+    with pytest.raises(TypeError, match="Public serializer requires authentically validated ValidatedDecision"):
+        serialize_decisions_to_csv([forged])
 
 
 def test_validated_wrapper_serializes_normally():
