@@ -105,9 +105,10 @@ class ReconciledLedger:
     unquantifiable_commitments: List[UnquantifiableCommitment]
     recurring_salary_amount: Optional[Decimal]
     salary_cancelled: bool
-    user_general_matched_count: int
-    matched_deltas_count: int
+    user_general_matched_count: int  # active user_general deltas matched
+    matched_deltas_count: int        # total active deltas matched (user_general + specific)
     unmatched_deltas_count: int
+    no_change_deltas_count: int = 0  # confirm_no_change deltas
 
 
 # ---------------------------------------------------------------------------
@@ -391,9 +392,10 @@ def reconcile_user_ledger(
       2. Cash-state rules (pending debit reservation, pending credit exclusion, non-cash/unrealized exclusion)
       3. Message deltas conflict-priority resolution & deduplication
       4. Preservation of scheduled salary dates when updating amounts
-      5. Synthesized confirmed recurring salary stream for active salary users
-      6. Exact currency normalization to home_currency via CurrencyConverter
-      7. Separation into recurring vs one-time and flexible vs fixed/protected
+      5. Deterministic recurring-stream date shift for payday amendments
+      6. Synthesized confirmed recurring salary stream for active salary users
+      7. Exact currency normalization to home_currency via CurrencyConverter
+      8. Separation into recurring vs one-time and flexible vs fixed/protected
     """
     if converter is None:
         converter = CurrencyConverter(ds.exchange_rates)
@@ -402,8 +404,16 @@ def reconcile_user_ledger(
     raw_events = ds.get_events_for_user(user_id)
     image_extractions = extracted_data.get("image_extractions", [])
     all_deltas = extracted_data.get("message_deltas", [])
-    user_deltas = [d for d in all_deltas if d.get("user_id") == user_id]
     msg_map = {m.message_id: m for m in ds.messages}
+
+    # Match all user deltas, resolving user_id from message metadata if omitted (e.g. confirm_no_change)
+    user_deltas = []
+    for d in all_deltas:
+        uid = d.get("user_id")
+        if not uid and d.get("message_id") in msg_map:
+            uid = msg_map[d["message_id"]].user_id
+        if uid == user_id:
+            user_deltas.append(d)
 
     # Find user's evaluation request date
     request_date: Optional[date] = None
@@ -439,17 +449,20 @@ def reconcile_user_ledger(
     salary_cancelled = False
     recurring_salary_amount: Optional[Decimal] = None
     next_salary_date: Optional[date] = None
-    matched_deltas_count = 0
-    user_general_matched_count = 0
+
+    # Counters: separate active counters from confirm_no_change
+    matched_deltas_count = 0        # Total active deltas matched
+    user_general_matched_count = 0  # Active user_general deltas matched
     unmatched_deltas_count = 0
+    no_change_deltas_count = 0      # confirm_no_change deltas
+
     new_events_to_add: List[FinancialEvent] = []
 
     for delta in user_deltas:
         action = delta.get("action")
         if action == "confirm_no_change":
-            matched_deltas_count += 1
-            if delta.get("target") == "user_general":
-                user_general_matched_count += 1
+            # Explicit rule: confirm_no_change deltas MUST NOT affect active counters
+            no_change_deltas_count += 1
             continue
 
         msg = msg_map.get(delta.get("message_id"))
@@ -493,31 +506,50 @@ def reconcile_user_ledger(
                 valid_cash_events = filtered
             continue
 
-        # Date amendment (Preserves scheduled event amount, updates dates)
+        # Date amendment (Preserves scheduled event amount, shifts dates with preserved monthly cadence)
         if action == "amend" and delta.get("field") == "date":
             if delta.get("effective_date"):
                 eff_d = date.fromisoformat(delta["effective_date"])
                 if match_res.category == "salary":
                     next_salary_date = eff_d
+                    new_payday = eff_d.day
+
+                    # Deterministic recurring-stream date shift:
+                    # Preserves monthly cadence and maps each affected payment to its correct future occurrence
                     updated = []
+                    seen_dates: Set[date] = set()
+
                     for ev in valid_cash_events:
-                        if ev.category == "salary" and ev.status == "scheduled":
-                            ev = FinancialEvent(
-                                event_id=ev.event_id,
-                                user_id=ev.user_id,
-                                event_type=ev.event_type,
-                                description=ev.description,
-                                category=ev.category,
-                                direction=ev.direction,
-                                amount=ev.amount,
-                                currency=ev.currency,
-                                event_date=eff_d,
-                                settlement_date=eff_d,
-                                status=ev.status,
-                                linked_event_id=ev.linked_event_id,
-                                flexibility=ev.flexibility,
-                                minimum_allowed_amount=ev.minimum_allowed_amount,
-                            )
+                        if ev.category == "salary" and ev.direction == "credit" and ev.status == "scheduled":
+                            orig_d = ev.event_date
+                            if (orig_d.year, orig_d.month) >= (eff_d.year, eff_d.month):
+                                max_d = calendar.monthrange(orig_d.year, orig_d.month)[1]
+                                shifted_d = date(orig_d.year, orig_d.month, min(new_payday, max_d))
+                                while shifted_d in seen_dates:
+                                    if shifted_d.month == 12:
+                                        y, m = shifted_d.year + 1, 1
+                                    else:
+                                        y, m = shifted_d.year, shifted_d.month + 1
+                                    shifted_d = date(y, m, min(new_payday, calendar.monthrange(y, m)[1]))
+                                seen_dates.add(shifted_d)
+                                ev = FinancialEvent(
+                                    event_id=ev.event_id,
+                                    user_id=ev.user_id,
+                                    event_type=ev.event_type,
+                                    description=ev.description,
+                                    category=ev.category,
+                                    direction=ev.direction,
+                                    amount=ev.amount,
+                                    currency=ev.currency,
+                                    event_date=shifted_d,
+                                    settlement_date=shifted_d,
+                                    status=ev.status,
+                                    linked_event_id=ev.linked_event_id,
+                                    flexibility=ev.flexibility,
+                                    minimum_allowed_amount=ev.minimum_allowed_amount,
+                                )
+                            else:
+                                seen_dates.add(ev.event_date)
                         updated.append(ev)
                     valid_cash_events = updated
             continue
@@ -776,6 +808,7 @@ def reconcile_user_ledger(
         user_general_matched_count=user_general_matched_count,
         matched_deltas_count=matched_deltas_count,
         unmatched_deltas_count=unmatched_deltas_count,
+        no_change_deltas_count=no_change_deltas_count,
     )
 
 

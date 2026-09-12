@@ -4,6 +4,7 @@ Comprehensive unit tests for the Reconciliation Engine (Phase 3).
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import pytest
@@ -138,7 +139,7 @@ def test_currency_normalization(datastore: DataStore, extracted_data: dict, conv
 
 
 # ---------------------------------------------------------------------------
-# Test 4: Delta Category Matching Logic & Exact Counts
+# Test 4: Delta Category Matching Logic & Active Counter Invariants
 # ---------------------------------------------------------------------------
 
 def test_exact_active_deltas_category_mapping(datastore: DataStore, extracted_data: dict):
@@ -176,6 +177,35 @@ def test_exact_active_deltas_category_mapping(datastore: DataStore, extracted_da
     assert sum(cat_counts.values()) == 113
     # Explicitly confirm all 6 cancellations are in the salary category
     assert cancel_salary_count == 6
+
+
+def test_confirm_no_change_cannot_affect_active_counters(
+    datastore: DataStore, extracted_data: dict, converter: CurrencyConverter
+):
+    """Direct proof that the 116 confirm_no_change deltas cannot affect active counters."""
+    # Run standard reconciliation for user_02
+    ledger_before = reconcile_user_ledger("user_02", datastore, extracted_data, converter)
+    matched_before = ledger_before.matched_deltas_count
+    ug_before = ledger_before.user_general_matched_count
+
+    # Inject multiple synthetic confirm_no_change deltas for user_02
+    modified_extracted = copy.deepcopy(extracted_data)
+    for i in range(10):
+        modified_extracted["message_deltas"].append({
+            "message_id": f"msg_synth_nochange_{i}",
+            "user_id": "user_02",
+            "action": "confirm_no_change",
+            "target": "user_general",
+            "reasoning": "Synthetic confirm no change",
+        })
+
+    ledger_after = reconcile_user_ledger("user_02", datastore, modified_extracted, converter)
+
+    # Active counters MUST remain completely unchanged
+    assert ledger_after.matched_deltas_count == matched_before
+    assert ledger_after.user_general_matched_count == ug_before
+    # confirm_no_change counter is incremented separately
+    assert ledger_after.no_change_deltas_count == ledger_before.no_change_deltas_count + 10
 
 
 # ---------------------------------------------------------------------------
@@ -316,7 +346,6 @@ def test_hand_verified_case_5_preserve_scheduled_salary_dates(
       - Event 1 retains its date (2026-07-15).
       - Event 2 retains its date (2026-08-15) and is NOT collapsed onto 2026-07-15.
     """
-    # Create two pre-existing scheduled events for user_216
     event_jul = FinancialEvent(
         event_id="sched_test_jul",
         user_id="user_216",
@@ -350,7 +379,6 @@ def test_hand_verified_case_5_preserve_scheduled_salary_dates(
         minimum_allowed_amount=None,
     )
 
-    # Reconcile user_216 with these two pre-existing scheduled events present
     orig_get_events = datastore.get_events_for_user
 
     def mock_get_events(uid: str):
@@ -359,7 +387,6 @@ def test_hand_verified_case_5_preserve_scheduled_salary_dates(
             return list(evs) + [event_jul, event_aug]
         return evs
 
-    # Temporarily monkeypatch get_events_for_user
     datastore.get_events_for_user = mock_get_events
     try:
         ledger = reconcile_user_ledger("user_216", datastore, extracted_data, converter)
@@ -381,7 +408,89 @@ def test_hand_verified_case_5_preserve_scheduled_salary_dates(
 
 
 # ---------------------------------------------------------------------------
-# Test 7: Full-Dataset Reconciliation Invariants
+# Test 7: Hand-Verified Date Amendment Shift (No Collapsing)
+# ---------------------------------------------------------------------------
+
+def test_salary_date_amendment_preserves_monthly_cadence_without_collapsing(
+    datastore: DataStore, extracted_data: dict, converter: CurrencyConverter
+):
+    """Verify that a salary date amendment preserves the monthly cadence across multiple events.
+
+    Tests two pre-existing scheduled salary events on the 15th:
+      - Event 1: 2024-09-15
+      - Event 2: 2024-10-15
+    When a date amendment shifts payroll to the 23rd (effective 2024-09-23 via message_05):
+      - Event 1 shifts to 2024-09-23
+      - Event 2 shifts to 2024-10-23
+      - Distinct future dates remain distinct (2024-09-23 != 2024-10-23)
+      - The monthly cadence is preserved (1 month apart)
+      - No duplicate salary credits occur on any date
+    """
+    event_sep = FinancialEvent(
+        event_id="sched_u07_sep",
+        user_id="user_07",
+        event_type="income",
+        description="Scheduled September salary",
+        category="salary",
+        direction="credit",
+        amount=Decimal("149000"),
+        currency="INR",
+        event_date=date(2024, 9, 15),
+        settlement_date=date(2024, 9, 15),
+        status="scheduled",
+        linked_event_id=None,
+        flexibility="fixed",
+        minimum_allowed_amount=None,
+    )
+    event_oct = FinancialEvent(
+        event_id="sched_u07_oct",
+        user_id="user_07",
+        event_type="income",
+        description="Scheduled October salary",
+        category="salary",
+        direction="credit",
+        amount=Decimal("149000"),
+        currency="INR",
+        event_date=date(2024, 10, 15),
+        settlement_date=date(2024, 10, 15),
+        status="scheduled",
+        linked_event_id=None,
+        flexibility="fixed",
+        minimum_allowed_amount=None,
+    )
+
+    orig_get_events = datastore.get_events_for_user
+
+    def mock_get_events(uid: str):
+        evs = orig_get_events(uid)
+        if uid == "user_07":
+            return list(evs) + [event_sep, event_oct]
+        return evs
+
+    datastore.get_events_for_user = mock_get_events
+    try:
+        ledger = reconcile_user_ledger("user_07", datastore, extracted_data, converter)
+    finally:
+        datastore.get_events_for_user = orig_get_events
+
+    ev_sep_rec = next(e for e in ledger.all_events if e.event_id == "sched_u07_sep")
+    ev_oct_rec = next(e for e in ledger.all_events if e.event_id == "sched_u07_oct")
+
+    # Distinct dates remain distinct
+    assert ev_sep_rec.event_date != ev_oct_rec.event_date
+    # Updated dates match the intended amended schedule
+    assert ev_sep_rec.event_date == date(2024, 9, 23)
+    assert ev_oct_rec.event_date == date(2024, 10, 23)
+    # Monthly cadence is preserved
+    assert (ev_oct_rec.event_date.year - ev_sep_rec.event_date.year) * 12 + (ev_oct_rec.event_date.month - ev_sep_rec.event_date.month) == 1
+
+    # Verify no duplicate same-day salary credits on the entire ledger
+    salary_credit_dates = [e.event_date for e in ledger.all_events if e.category == "salary" and e.direction == "credit"]
+    assert len(salary_credit_dates) == len(set(salary_credit_dates)), "Must not produce duplicate same-day salary credits"
+
+
+# ---------------------------------------------------------------------------
+# Test 8: Full-Dataset Reconciliation Invariants
 # ---------------------------------------------------------------------------
 
 def test_full_dataset_reconciliation(
@@ -395,11 +504,18 @@ def test_full_dataset_reconciliation(
     total_matched = sum(l.matched_deltas_count for l in ledgers.values())
     total_unmatched = sum(l.unmatched_deltas_count for l in ledgers.values())
     total_unquant = sum(len(l.unquantifiable_commitments) for l in ledgers.values())
+    total_no_change = sum(l.no_change_deltas_count for l in ledgers.values())
 
-    # Invariants
-    assert total_unmatched == 0, f"Expected 0 unmatched deltas, got {total_unmatched}"
+    # Exact Invariants:
+    # 1. Active user_general deltas == 113
     assert total_ug_matched == 113, f"Expected 113 matched user_general deltas, got {total_ug_matched}"
-    assert total_matched == 114, f"Expected 114 total matched active deltas (113 user_general + 1 specific), got {total_matched}"
+    # 2. Total active deltas (113 user_general + 1 specific event_4535) == 114
+    assert total_matched == 114, f"Expected 114 total active matched deltas, got {total_matched}"
+    # 3. confirm_no_change deltas == 116, excluded from active counters
+    assert total_no_change == 116, f"Expected 116 confirm_no_change deltas, got {total_no_change}"
+    # 4. Zero unmatched deltas
+    assert total_unmatched == 0, f"Expected 0 unmatched deltas, got {total_unmatched}"
+    # 5. Unquantifiable commitments == 8
     assert total_unquant == 8, f"Expected 8 unquantifiable commitments, got {total_unquant}"
 
     avg_unquant = total_unquant / len(ledgers)
