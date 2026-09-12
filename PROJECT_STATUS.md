@@ -148,3 +148,35 @@ Implemented fail-closed output validation and deterministic serialization in `co
    - `serialize_decision_row`, `serialize_decision_csv_line`, and `serialize_decisions_to_csv` format exact 8 columns without float conversion. Does not write root `output.csv`.
 3. Added comprehensive test suite in `code/tests/test_validation.py` (21 tests covering valid outcomes, bounds, malformed plans, status/method mismatches, invalid spending changes, stream conflicts, simulation safety rejections, and exact serialization).
    - Per explicit instructions, tests remain unexecuted in this task.
+
+## Phase 6 static review — 2026-09-12 (`0750a22`)
+
+Not approved; a focused correction is required before Phase 7.
+
+1. `validate_decision_result` checks only bounds for `amount_safe_to_pay` and
+   only date bounds for `earliest_date_for_full_payment`. It never recomputes
+   the no-spending-change baseline with Phase 4 helpers, so an arbitrary lower
+   safe amount or a later/non-earliest safe date can pass validation.
+2. The status/method conditional chain has no rejecting final branch for
+   `full_payment` paired with `affordable_later` or `not_affordable`. Those
+   invalid pairings can reach the simulator and be accepted when safe.
+3. Raw serializer functions accept any `DecisionResult`; validation is not a
+   required gate. The Phase 6 requirement is to serialize only validated rows.
+
+## Phase 6 correction — 2026-09-12
+
+Corrected all three static review blockers in `code/lib/validation.py` and `code/tests/test_validation.py`:
+1. Recomputed and enforced baseline facts:
+   - `validate_decision_result` independently recomputes `compute_amount_safe_to_pay` and `find_earliest_date_for_full_payment` (without spending changes).
+   - Enforces exact equality for `decision.amount_safe_to_pay` and `decision.earliest_date_for_full_payment` across all result types.
+2. Exhaustive status/method validation matrix:
+   - Enforces `ALLOWED_STATUS_METHOD_PAIRS` rejecting all invalid pairs (e.g. `affordable_later + full_payment`, `not_affordable + full_payment`, `not_affordable + partial_payment`) before simulation.
+3. Validation-gated serialization & finite Decimal enforcement:
+   - Introduced `ValidatedDecision` wrapper requiring instantiation through `validate_decision_result`.
+   - `serialize_decision_row`, `serialize_decision_csv_line`, and `serialize_decisions_to_csv` require `ValidatedDecision` and reject raw `DecisionResult` with `TypeError`.
+   - Rejects non-finite values (`NaN`, `Infinity`, `-Infinity`) across amount bounds, payment plans, and reduction amounts with `OutputValidationError`.
+4. Tests updated with 21 focused cases covering baseline recomputation, exhaustive matrix pairs, gated serialization, non-finite values, and contract constraints (reported as unexecuted per task instructions).
+
+
+The reported test count remains unexecuted implementer-provided evidence. Add
+targeted regression tests for each issue and retain the existing scope.
