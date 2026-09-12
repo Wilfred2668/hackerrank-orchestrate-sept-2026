@@ -1,0 +1,556 @@
+"""
+Unit tests for Phase 4: Deterministic 90-Day Cash-Flow Simulation and Affordability Search.
+
+Validates:
+  1. An immediate payment that is safe and stays above the minimum.
+  2. A payment that is unsafe due to a future pending debit or essential expense.
+  3. A later confirmed/scheduled salary that makes a full payment safe on a later date.
+  4. Binary-search boundary checks: returned safe amount passes; one smallest currency unit more fails.
+  5. A request with no safe full-payment date within 90 days.
+  6. A test proving earliest_date_for_full_payment equals request_date without payment-method choices.
+  7. Payment schedule validation (installments, invalid future/past dates).
+  8. Integration checks on real dataset sample requests (request_01, request_09, request_12).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import pytest
+from datetime import date, timedelta
+from decimal import Decimal
+
+from lib.loaders import DataStore
+from lib.models import FinancialEvent, FinancialProfile, Request
+from lib.reconciliation import (
+    ReconciledEvent,
+    ReconciledLedger,
+    reconcile_user_ledger,
+)
+from lib.simulation import (
+    SafetyResult,
+    SimulationTimeline,
+    clean_decimal,
+    compute_amount_safe_to_pay,
+    evaluate_schedule_safety,
+    find_earliest_date_for_full_payment,
+    simulate_cash_flow,
+)
+
+
+@pytest.fixture(scope="module")
+def datastore() -> DataStore:
+    return DataStore()
+
+
+@pytest.fixture(scope="module")
+def extracted_data() -> dict:
+    repo_root = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    json_path = os.path.join(repo_root, "code", "data", "extracted_deltas.json")
+    with open(json_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _build_test_ledger(
+    user_id: str = "test_user",
+    home_currency: str = "USD",
+    current_available_balance: Decimal = Decimal("10000.00"),
+    minimum_balance_to_keep: Decimal = Decimal("2000.00"),
+    events: list[ReconciledEvent] | None = None,
+) -> ReconciledLedger:
+    """Helper to construct a controlled ReconciledLedger for unit testing."""
+    ev_list = events or []
+    return ReconciledLedger(
+        user_id=user_id,
+        home_currency=home_currency,
+        current_available_balance=current_available_balance,
+        minimum_balance_to_keep=minimum_balance_to_keep,
+        all_events=ev_list,
+        recurring_events=[e for e in ev_list if e.is_recurring],
+        one_time_events=[e for e in ev_list if not e.is_recurring],
+        flexible_events=[e for e in ev_list if e.is_reducible or e.is_stoppable],
+        fixed_or_protected_events=[e for e in ev_list if e.is_protected],
+        unquantifiable_commitments=[],
+        recurring_salary_amount=None,
+        salary_cancelled=False,
+        user_general_matched_count=0,
+        matched_deltas_count=0,
+        unmatched_deltas_count=0,
+    )
+
+
+def _build_test_event(
+    event_id: str,
+    event_date: date,
+    settlement_date: date | None,
+    direction: str,
+    amount: Decimal,
+    category: str = "general",
+    status: str = "settled",
+) -> ReconciledEvent:
+    """Helper to construct a ReconciledEvent."""
+    return ReconciledEvent(
+        event_id=event_id,
+        user_id="test_user",
+        event_type="expense" if direction == "debit" else "income",
+        description=f"Test {category}",
+        category=category,
+        direction=direction,  # type: ignore
+        original_amount=amount,
+        original_currency="USD",
+        normalized_amount=amount,
+        home_currency="USD",
+        event_date=event_date,
+        settlement_date=settlement_date or event_date,
+        status=status,  # type: ignore
+        flexibility="fixed",
+        minimum_allowed_amount=None,
+        is_recurring=False,
+        is_protected=True,
+        is_reducible=False,
+        is_stoppable=False,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test Scenario 1: Immediate payment that is safe and stays above minimum
+# ---------------------------------------------------------------------------
+
+def test_scenario_1_immediate_payment_safe():
+    """An immediate payment that is safe and stays above minimum across 90 days.
+
+    Setup:
+      - Current balance: 10,000.00
+      - Minimum to keep: 2,000.00
+      - Request: 5,000.00 on 2026-05-01
+      - No adverse future debits
+    Expectations:
+      - Daily balance timeline starts at 5,000.00 and remains 5,000.00 for 91 days
+      - Minimum balance = 5,000.00 > 2,000.00
+      - Safety result is_safe = True
+      - amount_safe_to_pay = 5,000.00 (capped at requested_amount)
+      - earliest_date_for_full_payment = 2026-05-01
+    """
+    req_date = date(2026, 5, 1)
+    req_amount = Decimal("5000.00")
+    ledger = _build_test_ledger(
+        current_available_balance=Decimal("10000.00"),
+        minimum_balance_to_keep=Decimal("2000.00"),
+    )
+
+    # 1. Timeline simulation with proposed payment
+    timeline = simulate_cash_flow(
+        ledger=ledger,
+        request_date=req_date,
+        payments=[(req_date, req_amount)],
+    )
+    assert len(timeline.daily_balances) == 91
+    assert timeline.start_date == req_date
+    assert timeline.end_date == req_date + timedelta(days=90)
+    assert timeline.daily_balances[req_date] == Decimal("5000.00")
+    assert timeline.daily_balances[req_date + timedelta(days=90)] == Decimal("5000.00")
+    assert timeline.minimum_balance == Decimal("5000.00")
+
+    # 2. Safety predicate
+    safety = evaluate_schedule_safety(
+        ledger=ledger,
+        request_date=req_date,
+        payments=[(req_date, req_amount)],
+    )
+    assert safety.is_safe is True
+    assert safety.minimum_balance == Decimal("5000.00")
+    assert safety.first_unsafe_date is None
+
+    # 3. amount_safe_to_pay
+    safe_pay = compute_amount_safe_to_pay(
+        ledger=ledger,
+        request_date=req_date,
+        requested_amount=req_amount,
+    )
+    assert safe_pay == Decimal("5000.00")
+
+    # 4. earliest_date_for_full_payment
+    earliest = find_earliest_date_for_full_payment(
+        ledger=ledger,
+        request_date=req_date,
+        requested_amount=req_amount,
+    )
+    assert earliest == req_date
+
+
+# ---------------------------------------------------------------------------
+# Test Scenario 2: Unsafe due to future pending debit or essential expense
+# ---------------------------------------------------------------------------
+
+def test_scenario_2_payment_unsafe_due_to_future_debit():
+    """A payment that looks safe on request_date but fails due to a future pending debit.
+
+    Setup:
+      - Current balance: 10,000.00
+      - Minimum to keep: 2,000.00
+      - Request: 7,000.00 on 2026-05-01
+      - Pending debit: 2,000.00 settling on 2026-05-05
+    Hand calculation:
+      - On 2026-05-01: balance after payment = 10,000 - 7,000 = 3,000.00 (>= 2,000)
+      - On 2026-05-05: pending debit settles, balance = 3,000 - 2,000 = 1,000.00 (< 2,000) -> UNSAFE!
+      - Baseline minimum balance without payment = 8,000.00 on 2026-05-05.
+      - Safe headroom = 8,000 - 2,000 = 6,000.00.
+      - amount_safe_to_pay must equal 6,000.00.
+    """
+    req_date = date(2026, 5, 1)
+    pending_debit_date = date(2026, 5, 5)
+    pending_event = _build_test_event(
+        event_id="pending_01",
+        event_date=date(2026, 4, 28),
+        settlement_date=pending_debit_date,
+        direction="debit",
+        amount=Decimal("2000.00"),
+        status="pending",
+    )
+    ledger = _build_test_ledger(
+        current_available_balance=Decimal("10000.00"),
+        minimum_balance_to_keep=Decimal("2000.00"),
+        events=[pending_event],
+    )
+
+    # 1. Full 7,000 payment is unsafe on 2026-05-05
+    safety = evaluate_schedule_safety(
+        ledger=ledger,
+        request_date=req_date,
+        payments=[(req_date, Decimal("7000.00"))],
+    )
+    assert safety.is_safe is False
+    assert safety.minimum_balance == Decimal("1000.00")
+    assert safety.first_unsafe_date == pending_debit_date
+
+    # 2. compute_amount_safe_to_pay returns exactly 6,000.00
+    safe_pay = compute_amount_safe_to_pay(
+        ledger=ledger,
+        request_date=req_date,
+        requested_amount=Decimal("7000.00"),
+    )
+    assert safe_pay == Decimal("6000.00")
+
+    # 3. Boundary check: 6,000.00 passes, 6,000.01 fails
+    safe_test = evaluate_schedule_safety(
+        ledger=ledger,
+        request_date=req_date,
+        payments=[(req_date, Decimal("6000.00"))],
+    )
+    assert safe_test.is_safe is True
+    assert safe_test.minimum_balance == Decimal("2000.00")
+
+    unsafe_test = evaluate_schedule_safety(
+        ledger=ledger,
+        request_date=req_date,
+        payments=[(req_date, Decimal("6000.01"))],
+    )
+    assert unsafe_test.is_safe is False
+    assert unsafe_test.minimum_balance == Decimal("1999.99")
+    assert unsafe_test.first_unsafe_date == pending_debit_date
+
+
+# ---------------------------------------------------------------------------
+# Test Scenario 3: Later confirmed/scheduled salary makes payment safe later
+# ---------------------------------------------------------------------------
+
+def test_scenario_3_later_salary_makes_full_payment_safe():
+    """Payment unsafe immediately, but becomes safe after a scheduled salary credit.
+
+    Setup:
+      - Current balance: 3,000.00
+      - Minimum to keep: 1,500.00
+      - Request: 4,000.00 on 2026-05-01
+      - Scheduled salary: 5,000.00 settling on 2026-05-25
+    Hand calculation:
+      - Immediate payment: 3,000 - 4,000 = -1,000 < 1,500 -> unsafe on 2026-05-01.
+      - Before 2026-05-25: any payment of 4,000 leaves balance < 1,500.
+      - On 2026-05-25: balance becomes 3,000 + 5,000 = 8,000.
+      - Paying 4,000 on 2026-05-25 leaves 4,000 >= 1,500 through day 90 -> SAFE!
+      - earliest_date_for_full_payment must be exactly 2026-05-25.
+      - amount_safe_to_pay on request_date = 3,000 - 1,500 = 1,500.00.
+    """
+    req_date = date(2026, 5, 1)
+    salary_date = date(2026, 5, 25)
+    salary_event = _build_test_event(
+        event_id="sched_sal_01",
+        event_date=salary_date,
+        settlement_date=salary_date,
+        direction="credit",
+        amount=Decimal("5000.00"),
+        category="salary",
+        status="scheduled",
+    )
+    ledger = _build_test_ledger(
+        current_available_balance=Decimal("3000.00"),
+        minimum_balance_to_keep=Decimal("1500.00"),
+        events=[salary_event],
+    )
+
+    # 1. Immediate payment is unsafe
+    imm_safety = evaluate_schedule_safety(
+        ledger=ledger,
+        request_date=req_date,
+        payments=[(req_date, Decimal("4000.00"))],
+    )
+    assert imm_safety.is_safe is False
+    assert imm_safety.first_unsafe_date == req_date
+
+    # 2. Safe to pay today is 1,500.00
+    safe_pay = compute_amount_safe_to_pay(
+        ledger=ledger,
+        request_date=req_date,
+        requested_amount=Decimal("4000.00"),
+    )
+    assert safe_pay == Decimal("1500.00")
+
+    # 3. Earliest full payment date is salary_date (2026-05-25)
+    earliest = find_earliest_date_for_full_payment(
+        ledger=ledger,
+        request_date=req_date,
+        requested_amount=Decimal("4000.00"),
+    )
+    assert earliest == salary_date
+
+    # 4. Verify payment on day before salary is unsafe
+    day_before = salary_date - timedelta(days=1)
+    day_before_safety = evaluate_schedule_safety(
+        ledger=ledger,
+        request_date=req_date,
+        payments=[(day_before, Decimal("4000.00"))],
+    )
+    assert day_before_safety.is_safe is False
+    assert day_before_safety.first_unsafe_date == day_before
+
+    # 5. Verify payment on salary date is safe
+    salary_day_safety = evaluate_schedule_safety(
+        ledger=ledger,
+        request_date=req_date,
+        payments=[(salary_date, Decimal("4000.00"))],
+    )
+    assert salary_day_safety.is_safe is True
+    assert salary_day_safety.minimum_balance == Decimal("3000.00")  # (3,000 on days 1-24, 4,000 on days 25+)
+
+
+# ---------------------------------------------------------------------------
+# Test Scenario 4: Exact Binary-Search Boundary Checks
+# ---------------------------------------------------------------------------
+
+def test_scenario_4_binary_search_boundary_checks():
+    """Verify binary search returns exact safe cent, and safe_amount + 0.01 fails.
+
+    Setup:
+      - Starting balance: 5,432.10
+      - Minimum to keep: 1,000.00
+      - Scheduled debit on day 10: 1,234.50
+      - Request: 4,000.00 on 2026-05-01
+    Calculation:
+      - Baseline min balance: 5,432.10 - 1,234.50 = 4,197.60
+      - Safe headroom: 4,197.60 - 1,000.00 = 3,197.60
+      - Requested amount is 4,000.00 > 3,197.60
+      - Safe amount must be exactly 3,197.60
+    """
+    req_date = date(2026, 5, 1)
+    debit_date = req_date + timedelta(days=10)
+    debit_event = _build_test_event(
+        event_id="debit_01",
+        event_date=debit_date,
+        settlement_date=debit_date,
+        direction="debit",
+        amount=Decimal("1234.50"),
+        category="utilities",
+        status="scheduled",
+    )
+    ledger = _build_test_ledger(
+        current_available_balance=Decimal("5432.10"),
+        minimum_balance_to_keep=Decimal("1000.00"),
+        events=[debit_event],
+    )
+
+    safe_pay = compute_amount_safe_to_pay(
+        ledger=ledger,
+        request_date=req_date,
+        requested_amount=Decimal("4000.00"),
+        step=Decimal("0.01"),
+    )
+    assert safe_pay == Decimal("3197.60")
+
+    # Boundary check 1: safe_pay passes
+    res_pass = evaluate_schedule_safety(
+        ledger=ledger,
+        request_date=req_date,
+        payments=[(req_date, safe_pay)],
+    )
+    assert res_pass.is_safe is True
+    assert res_pass.minimum_balance == Decimal("1000.00")
+
+    # Boundary check 2: safe_pay + 0.01 fails
+    res_fail = evaluate_schedule_safety(
+        ledger=ledger,
+        request_date=req_date,
+        payments=[(req_date, safe_pay + Decimal("0.01"))],
+    )
+    assert res_fail.is_safe is False
+    assert res_fail.minimum_balance == Decimal("999.99")
+    assert res_fail.first_unsafe_date == debit_date
+
+
+# ---------------------------------------------------------------------------
+# Test Scenario 5: No safe full-payment date within 90 days
+# ---------------------------------------------------------------------------
+
+def test_scenario_5_no_safe_date_within_90_days():
+    """When a full payment is impossible throughout the entire 90-day horizon.
+
+    Setup:
+      - Starting balance: 2,000.00
+      - Minimum to keep: 1,000.00
+      - Debits: 500.00 on day 10
+      - Request: 10,000.00 on 2026-05-01
+      - No large credits arrive
+    Expectations:
+      - earliest_date_for_full_payment returns None
+      - amount_safe_to_pay = 2,000 - 500 - 1,000 = 500.00
+    """
+    req_date = date(2026, 5, 1)
+    debit_event = _build_test_event(
+        event_id="debit_02",
+        event_date=req_date + timedelta(days=10),
+        settlement_date=req_date + timedelta(days=10),
+        direction="debit",
+        amount=Decimal("500.00"),
+        category="insurance",
+        status="scheduled",
+    )
+    ledger = _build_test_ledger(
+        current_available_balance=Decimal("2000.00"),
+        minimum_balance_to_keep=Decimal("1000.00"),
+        events=[debit_event],
+    )
+
+    earliest = find_earliest_date_for_full_payment(
+        ledger=ledger,
+        request_date=req_date,
+        requested_amount=Decimal("10000.00"),
+    )
+    assert earliest is None
+
+    safe_pay = compute_amount_safe_to_pay(
+        ledger=ledger,
+        request_date=req_date,
+        requested_amount=Decimal("10000.00"),
+    )
+    assert safe_pay == Decimal("500.00")
+
+
+# ---------------------------------------------------------------------------
+# Test Scenario 6: earliest_date_for_full_payment equals request_date without preferences
+# ---------------------------------------------------------------------------
+
+def test_scenario_6_earliest_date_equals_request_date_independent_of_preferences():
+    """earliest_date_for_full_payment evaluates purely financial safety independently
+    of whether the user profile accepts full payment or installments.
+
+    Setup:
+      - Starting balance: 50,000.00
+      - Minimum to keep: 5,000.00
+      - Request: 10,000.00 on 2026-06-01
+    Expectations:
+      - Returns exactly 2026-06-01 (request_date)
+    """
+    req_date = date(2026, 6, 1)
+    ledger = _build_test_ledger(
+        current_available_balance=Decimal("50000.00"),
+        minimum_balance_to_keep=Decimal("5000.00"),
+    )
+
+    earliest = find_earliest_date_for_full_payment(
+        ledger=ledger,
+        request_date=req_date,
+        requested_amount=Decimal("10000.00"),
+    )
+    assert earliest == req_date
+
+
+# ---------------------------------------------------------------------------
+# Test Scenario 7: Multi-Payment Schedule and Out-of-Window Dates
+# ---------------------------------------------------------------------------
+
+def test_scenario_7_installment_schedule_and_boundary_dates():
+    """Verify safety evaluation across multi-payment schedules and out-of-window dates."""
+    req_date = date(2026, 5, 1)
+    ledger = _build_test_ledger(
+        current_available_balance=Decimal("6000.00"),
+        minimum_balance_to_keep=Decimal("1000.00"),
+    )
+
+    # 1. 3-installment plan within window: 1500 on day 0, 1500 on day 30, 1500 on day 60
+    schedule = [
+        (req_date, Decimal("1500.00")),
+        (req_date + timedelta(days=30), Decimal("1500.00")),
+        (req_date + timedelta(days=60), Decimal("1500.00")),
+    ]
+    res = evaluate_schedule_safety(
+        ledger=ledger,
+        request_date=req_date,
+        payments=schedule,
+    )
+    assert res.is_safe is True
+    assert res.minimum_balance == Decimal("1500.00")  # 6,000 - 4,500 = 1,500 >= 1,000
+
+    # 2. Payment date before request_date
+    past_schedule = [(req_date - timedelta(days=1), Decimal("1000.00"))]
+    past_res = evaluate_schedule_safety(
+        ledger=ledger,
+        request_date=req_date,
+        payments=past_schedule,
+    )
+    assert past_res.is_safe is False
+    assert past_res.first_unsafe_date == req_date - timedelta(days=1)
+
+    # 3. Payment date after 90 days
+    future_schedule = [(req_date + timedelta(days=91), Decimal("1000.00"))]
+    future_res = evaluate_schedule_safety(
+        ledger=ledger,
+        request_date=req_date,
+        payments=future_schedule,
+    )
+    assert future_res.is_safe is False
+    assert future_res.first_unsafe_date == req_date + timedelta(days=91)
+
+
+# ---------------------------------------------------------------------------
+# Test Scenario 8: Integration on Real Dataset Sample Requests
+# ---------------------------------------------------------------------------
+
+def test_scenario_8_real_dataset_sample_requests(datastore: DataStore, extracted_data: dict):
+    """Verify simulation and affordability search on real dataset requests."""
+    # request_01: user_01 has ample balance (58,481.10 - 18,000 = 40,481.10)
+    # request: 25,256.00 on 2024-03-03
+    ledger_01 = reconcile_user_ledger("user_01", datastore, extracted_data)
+    req_01 = next(r for r in datastore.sample_requests if r.request_id == "request_01")
+    safe_pay_01 = compute_amount_safe_to_pay(ledger_01, req_01.request_date, req_01.requested_amount)
+    earliest_01 = find_earliest_date_for_full_payment(ledger_01, req_01.request_date, req_01.requested_amount)
+
+    assert safe_pay_01 == Decimal("25256")
+    assert earliest_01 == date(2024, 3, 3)
+
+    # request_09: user_09 has EUR 2,231.10, min 600
+    # request: EUR 166.61 on 2026-07-04
+    ledger_09 = reconcile_user_ledger("user_09", datastore, extracted_data)
+    req_09 = next(r for r in datastore.sample_requests if r.request_id == "request_09")
+    safe_pay_09 = compute_amount_safe_to_pay(ledger_09, req_09.request_date, req_09.requested_amount)
+    earliest_09 = find_earliest_date_for_full_payment(ledger_09, req_09.request_date, req_09.requested_amount)
+
+    assert safe_pay_09 == Decimal("166.61")
+    assert earliest_09 == date(2026, 7, 4)
+
+    # request_12: user_12 has ZAR 193,089.89, min 43,200
+    # request: ZAR 65,164.00 on 2026-04-05
+    ledger_12 = reconcile_user_ledger("user_12", datastore, extracted_data)
+    req_12 = next(r for r in datastore.sample_requests if r.request_id == "request_12")
+    safe_pay_12 = compute_amount_safe_to_pay(ledger_12, req_12.request_date, req_12.requested_amount)
+    earliest_12 = find_earliest_date_for_full_payment(ledger_12, req_12.request_date, req_12.requested_amount)
+
+    assert safe_pay_12 == Decimal("65164")
+    assert earliest_12 == date(2026, 4, 5)
