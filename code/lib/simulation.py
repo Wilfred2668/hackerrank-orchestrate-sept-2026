@@ -197,38 +197,22 @@ def get_conservative_recurring_amount(events: Sequence[ReconciledEvent]) -> Deci
 
 
 def get_conservative_essential_amount(events: Sequence[ReconciledEvent]) -> Decimal:
-    """Return a cautious recurring essential amount without repeating an outlier.
+    """Return the median normal amount from recent settled essential events.
 
-    Variable essentials such as groceries legitimately fluctuate, so the estimate
-    keeps the largest amount from recent history.  A lone extreme purchase,
-    however (for example a bulk stock-up or an image-backed catch-up bill), is
-    evidence of one exceptional transaction rather than a weekly commitment.
-    Repeating it throughout the 90-day forecast can make a safe recommendation
-    falsely look impossible.
-
-    An amount is excluded only when there are at least five recent observations
-    and it is more than double *both* the next-largest value and the median.
-    This leaves ordinary high weeks in place while filtering only a clearly
-    isolated spike.
+    Variable essentials such as groceries and transport legitimately fluctuate
+    week to week. Projecting the single highest peak over 13 consecutive weeks
+    compounds into an unrealistically severe drain on the user's balance.
+    Using the median of recent settled occurrences provides a realistic,
+    grounded baseline that prevents false-positive insolvency rejections.
     """
     if not events:
         return Decimal("0.00")
 
     recent_amounts = sorted(e.normalized_amount for e in events[-8:])
-    if len(recent_amounts) < 5:
-        return recent_amounts[-1]
-
-    maximum = recent_amounts[-1]
-    second_largest = recent_amounts[-2]
-    middle = len(recent_amounts) // 2
+    mid = len(recent_amounts) // 2
     if len(recent_amounts) % 2:
-        median = recent_amounts[middle]
-    else:
-        median = (recent_amounts[middle - 1] + recent_amounts[middle]) / Decimal("2")
-
-    if maximum > second_largest * Decimal("2") and maximum > median * Decimal("2"):
-        return second_largest
-    return maximum
+        return clean_decimal(recent_amounts[mid])
+    return clean_decimal((recent_amounts[mid - 1] + recent_amounts[mid]) / Decimal("2"))
 
 
 def generate_future_recurring_occurrences(

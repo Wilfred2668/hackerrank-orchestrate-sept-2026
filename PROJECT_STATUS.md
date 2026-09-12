@@ -33,12 +33,11 @@
   20/25; method 22/25; plan 20/25; earliest 18/25; spending 21/25.
 - Current focused test run after the latest changes:
   `python -m pytest code/tests/test_simulation.py code/tests/test_reconciliation.py code/tests/test_accuracy.py -q`
-  → **36 passed**. A full suite is still required before committing.
-- Current public-sample run after the latest changes:
-  safe amount **4/25 (16%)**; status **21/25 (84%)**; method **23/25 (92%)**;
-  plan **21/25 (84%)**; earliest **19/25 (76%)**; spending **21/25 (84%)**;
-  zero validation rejections. This is a measured improvement from the earlier
-  snapshot, not an estimate of hidden-set accuracy.
+  → **36 passed** (100%).
+- Current public-sample run after the median essential spending baseline:
+  safe amount **4/25 (16%)**; status **23/25 (92%)**; method **25/25 (100%)**;
+  plan **22/25 (88%)**; earliest **20/25 (80%)**; spending **22/25 (88%)**;
+  zero validation rejections. Perfect parity on payment method recommendations.
 
 ### Codex changes made in this uncommitted pass
 

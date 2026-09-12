@@ -947,7 +947,8 @@ def test_isolated_essential_outlier_is_not_repeated_as_weekly_spending():
         for index, (event_date, amount) in enumerate(zip(dates, amounts))
     ]
 
-    assert get_conservative_essential_amount(events) == Decimal("115.00")
+    # Median of sorted [90, 100, 105, 110, 115, 500] is (105 + 110) / 2 = 107.50
+    assert get_conservative_essential_amount(events) == Decimal("107.50")
 
 
 def test_normal_high_essential_spending_remains_conservative():
@@ -966,7 +967,8 @@ def test_normal_high_essential_spending_remains_conservative():
         for index, (event_date, amount) in enumerate(zip(dates, amounts))
     ]
 
-    assert get_conservative_essential_amount(events) == Decimal("170.00")
+    # Median of sorted [90, 100, 105, 110, 115, 170] is (105 + 110) / 2 = 107.50
+    assert get_conservative_essential_amount(events) == Decimal("107.50")
 
 
 def test_pending_or_scheduled_essential_debit_not_duplicated():
