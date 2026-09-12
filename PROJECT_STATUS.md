@@ -1,5 +1,142 @@
 # Buy or Wait? — Project Status
 
+## Compact continuation handoff — 2026-09-13 01:25 IST
+
+### Mission and constraints
+
+- The user has completed the phased build and now wants accuracy/robustness
+  improvements only; packaging/submission is paused. They want an aspirational
+  score above 95%, but do **not** promise that result.
+- Work locally in `C:\hackerrank-orchestrate\hackerrank-orchestrate-september26`.
+  Do not pull GitHub unless asked. Keep this document updated and append only to
+  the ignored root `log.txt` after every user turn.
+- The current user explicitly authorized execution. Run focused tests and public
+  sample mode after a coherent change; do not regenerate the 250-row root
+  `output.csv` until sample diagnosis is materially complete.
+- Preserve challenge rules: use no sample IDs/labels in production logic; do not
+  hardcode answers; reserve pending debits; exclude pending credits/non-cash
+  gains; apply salary only on settlement dates; keep every recommended schedule
+  above `minimum_balance_to_keep`; do not invent unsupported financial facts.
+
+### Baseline and current state
+
+- Last committed handoff: `1cb044e` on `main` (Phase 7 corrective work,
+  reported 148 tests passing). It made the project runnable but its
+  `evaluation/sample_evaluation.md` is only a diagnostic artifact, not ground
+  truth for production rules.
+- Current worktree is intentionally dirty and uncommitted:
+  `PROJECT_STATUS.md`, `code/lib/reconciliation.py`,
+  `code/lib/simulation.py`, `code/tests/test_reconciliation.py`,
+  `code/tests/test_simulation.py`, and untracked `code/tests/test_accuracy.py`.
+  Preserve all of these; do not reset, checkout, or delete `scratch/`.
+- Before Codex changes, cached sample metrics were: safe amount 4/25; status
+  20/25; method 22/25; plan 20/25; earliest 18/25; spending 21/25.
+- Current focused test run after the latest changes:
+  `python -m pytest code/tests/test_simulation.py code/tests/test_reconciliation.py code/tests/test_accuracy.py -q`
+  → **36 passed**. A full suite is still required before committing.
+- Current public-sample run after the latest changes:
+  safe amount **4/25 (16%)**; status **21/25 (84%)**; method **23/25 (92%)**;
+  plan **21/25 (84%)**; earliest **19/25 (76%)**; spending **21/25 (84%)**;
+  zero validation rejections. This is a measured improvement from the earlier
+  snapshot, not an estimate of hidden-set accuracy.
+
+### Codex changes made in this uncommitted pass
+
+1. **Salary payday inference** (`code/lib/reconciliation.py`):
+   `infer_salary_payday` gives an explicit scheduled settlement date priority;
+   otherwise it uses a majority historical payday (at least three payments) so
+   a lone delayed/off-cycle salary receipt cannot move the whole stream. Regular
+   salary excludes arrears, bonuses, commissions, final/severance, adjustments,
+   and one-time payments. Three general regressions are in
+   `code/tests/test_accuracy.py`.
+2. **Salary source currency** (`code/lib/reconciliation.py`): synthesized
+   recurring salary retains the currency belonging to its source amount, then
+   is normalized once using the dated exchange rate. This fixed the invalid
+   treatment of a foreign-currency salary amount as though it were already in
+   the home currency. Regression added in `code/tests/test_reconciliation.py`.
+3. **Essential-spending outlier guard** (`code/lib/simulation.py`): new
+   `get_conservative_essential_amount` retains a normal high recent expense,
+   but rejects one high value only when there are at least five observations and
+   it exceeds both the second-highest amount and median by >2×. This prevents a
+   single bulk/catch-up grocery purchase from becoming every future weekly
+   grocery debit. Two regressions are in `code/tests/test_simulation.py`.
+   It raised request_17 safe-amount accuracy from a very large error to a
+   10,308.33 error and improved status/method/plan/earliest aggregate counts.
+
+### Diagnosis findings (use only to infer general rules)
+
+- `request_17` exposed the outlier issue: one image-backed 41,272 grocery item
+  was repeated weekly despite normal recent groceries around 7k–11k. The fix
+  is generic and materially improves its decision fields.
+- `request_03` was corrected by the salary-payday rule: an Aug-31 receipt no
+  longer displaced an established 15th-of-month payroll cadence.
+- The largest remaining dollar gaps are requests 02, 04, 25; they need event-
+  level cash-flow tracing, not generic buffers or sample-specific tuning.
+- Requests 13 and 23 expose a likely **later-payment horizon** defect. Current
+  `find_earliest_date_for_full_payment` simulates only until
+  `request_date + 90 days` for every candidate payment date. Thus a late safe
+  candidate can be rejected because the initial salary synthesis ends before
+  the next salary, while later commitments remain inside the truncated window.
+  The intended next experiment is below; it has **not been coded yet**.
+- Do not blindly remove `shopping`, `cloud_storage`, or rent projections just
+  to match samples. The visible labels sometimes conflict with a conservative
+  90-day reading; any change must be supported by a repeatable financial rule.
+
+### Exact next work item
+
+Evaluate (do not assume) a later-payment safety model that:
+
+1. preserves all cash flow from `request_date` to the candidate payment date;
+2. checks the candidate payment and commitments for 90 days **after** that
+   candidate date; and
+3. has regular confirmed salary synthesis available across that extended
+   timeline without duplicating credits or treating unconfirmed income as cash.
+
+Likely implementation path: make reconciliation produce enough existing
+regular-salary occurrences for an extended lookup horizon, then have
+`find_earliest_date_for_full_payment` call schedule safety with a horizon of
+`candidate_offset + 90`. Do this only with explicit tests demonstrating both
+that a later payment is rejected if it fails after the payment date and that
+an established recurring salary stream can support it. Measure sample metrics
+afterward. Review the specification wording and tradeoff first: this is more
+financially complete but forecasts farther than the original 90-day evaluation
+anchor, so it may change edge-case decisions and runtime.
+
+Then run the complete suite (`python -m pytest code/tests -q`), sample mode
+(`python code/main.py --mode sample`), update this document and `log.txt`, and
+commit only a coherent verified batch. Do **not** run the full 250 pipeline or
+write submission artifacts unless the user asks.
+
+### Bounded amount-accuracy check — 2026-09-13 01:40 IST
+
+The user requested a low-token, targeted correction for
+`amount_safe_to_pay`. A quick trace confirms the remaining misses are not one
+rounding or binary-search defect: the model is generally overestimating
+forecast headroom but the magnitude is highly variable (from 1.36 to millions
+in home-currency units). Do not apply a universal safety percentage, flat
+buffer, or sample-ID rule: those are not financially grounded and would be
+likely to reduce hidden-set accuracy. The next proper change remains an
+event-level reconciliation/forecast rule supported by a repeatable pattern
+(for example, cadence and commitment timing), measured with a focused
+regression and one sample run.
+
+## Accuracy takeover — 2026-09-13 00:50 IST
+
+Antigravity handoff confirmed at `1cb044e`; Codex now owns accuracy work.
+Packaging remains paused. Reproduced 148 passing tests. Added a general salary
+cadence rule: explicit scheduled settlement dates take precedence; otherwise a
+majority cadence supported by at least three historical payments survives an
+isolated off-cycle receipt. Explicit date amendments retain precedence.
+Three independent synthetic regressions added; complete suite: 151 passed.
+Cached sample execution: amount 4/25, status 20/25, method 22/25, plan 20/25,
+earliest date 18/25, spending changes 21/25; four requests match all six fields,
+zero validation rejections. This improves status, method, plan and earliest date
+by one request each over handoff. Safe-amount accuracy remains the main gap.
+Do not treat the earlier report's conservative-interpretation labels as proven:
+the salary cadence correction resolves one such claimed discrepancy.
+Next: trace baseline balance minima and projected expenses for remaining cases;
+compare per-currency and relative errors. No full output regeneration yet.
+
 Use this checkout as the primary review source:
 `C:\hackerrank-orchestrate\hackerrank-orchestrate-september26`.
 

@@ -18,6 +18,7 @@ Splits each ledger into:
 from __future__ import annotations
 
 import calendar
+from collections import Counter
 import logging
 import re
 from dataclasses import dataclass
@@ -158,6 +159,30 @@ def is_recurring_event(event: FinancialEvent, user_events: List[FinancialEvent])
                 return True
 
     return False
+
+
+def infer_salary_payday(events: List[FinancialEvent]) -> int:
+    """Prefer an explicit future settlement, then a repeated historical cadence.
+
+    A single receipt or delayed payment does not establish a new recurring payday.
+    Explicit date amendments are handled by the caller before this inference.
+    """
+    regular = [e for e in events if e.category == "salary" and e.direction == "credit"
+               and e.status in ("settled", "scheduled")
+               and not any(k in e.description.lower() for k in
+                           ("arrear", "bonus", "commission", "one-time", "adjustment", "final", "severance"))]
+    scheduled = [e for e in regular if e.status == "scheduled"]
+    if scheduled:
+        first = min(scheduled, key=lambda e: e.settlement_date or e.event_date)
+        return (first.settlement_date or first.event_date).day
+    if not regular:
+        return 15
+    dates = sorted({e.settlement_date or e.event_date for e in regular})
+    counts = Counter(d.day for d in dates)
+    day, count = max(counts.items(), key=lambda item: (item[1], item[0]))
+    if count >= 3 and count > len(dates) / 2:
+        return day
+    return dates[-1].day
 
 
 def _get_monthly_dates(start_date: date, end_date: date, day_of_month: int) -> List[date]:
@@ -690,6 +715,20 @@ def reconcile_user_ledger(
     if not salary_cancelled and request_date is not None:
         # Determine baseline active salary amount
         active_salary_amount: Optional[Decimal] = recurring_salary_amount
+        active_salary_currency: Optional[str] = None
+        regular_salary_events = [
+            e for e in valid_cash_events
+            if e.category == "salary" and e.direction == "credit"
+            and not any(k in e.description.lower() for k in (
+                "arrear", "bonus", "commission", "one-time", "adjustment", "final", "severance"
+            ))
+        ]
+        # A message amendment changes the amount but does not change the currency
+        # of the established salary stream.
+        if active_salary_amount is not None and regular_salary_events:
+            active_salary_currency = max(
+                regular_salary_events, key=lambda e: (e.event_date, e.event_id)
+            ).currency
         if active_salary_amount is None:
             # Check existing scheduled salary
             sched_sal = next(
@@ -698,6 +737,7 @@ def reconcile_user_ledger(
             )
             if sched_sal is not None:
                 active_salary_amount = sched_sal.amount
+                active_salary_currency = sched_sal.currency
             else:
                 # Check most recent regular settled salary
                 settled_sal = [
@@ -706,10 +746,13 @@ def reconcile_user_ledger(
                     and not any(k in e.description.lower() for k in ("arrear", "bonus", "commission", "one-time", "adjustment", "final"))
                 ]
                 if settled_sal:
-                    active_salary_amount = max(settled_sal, key=lambda x: x.event_date).amount
+                    latest_settled_sal = max(settled_sal, key=lambda x: (x.event_date, x.event_id))
+                    active_salary_amount = latest_settled_sal.amount
+                    active_salary_currency = latest_settled_sal.currency
 
         if active_salary_amount is not None and active_salary_amount > 0:
             recurring_salary_amount = active_salary_amount
+            active_salary_currency = active_salary_currency or profile.home_currency
             # Determine payday (day of month)
             if next_salary_date is not None:
                 payday = next_salary_date.day
@@ -719,10 +762,7 @@ def reconcile_user_ledger(
                     if e.category == "salary" and e.direction == "credit"
                     and not any(k in e.description.lower() for k in ("arrear", "bonus", "commission", "one-time", "adjustment", "final"))
                 ]
-                if existing_sal:
-                    payday = max(existing_sal, key=lambda x: x.event_date).event_date.day
-                else:
-                    payday = 15
+                payday = infer_salary_payday(existing_sal)
 
             # Forecast window [request_date, request_date + forecast_days]
             future_dates = _get_monthly_dates(request_date, request_date + timedelta(days=forecast_days), payday)
@@ -741,7 +781,9 @@ def reconcile_user_ledger(
                         category="salary",
                         direction="credit",
                         amount=active_salary_amount,
-                        currency=profile.home_currency,
+                        # Keep the source currency with the source amount. Currency
+                        # conversion happens once during ledger normalization.
+                        currency=active_salary_currency,
                         event_date=d_date,
                         settlement_date=d_date,
                         status="scheduled",

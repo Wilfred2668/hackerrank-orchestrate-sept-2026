@@ -115,6 +115,25 @@ def test_cash_state_rules_filtering(datastore: DataStore, extracted_data: dict, 
                 assert nc.event_id not in event_ids, f"Non-cash event {nc.event_id} must never touch cash balance"
 
 
+def test_synthesized_foreign_salary_preserves_source_currency(
+    datastore: DataStore, extracted_data: dict, converter: CurrencyConverter
+):
+    """A USD salary for an IDR user must remain USD until normalisation.
+
+    Treating the raw numeric amount as IDR would turn a confirmed 1,800 USD
+    monthly credit into 1,800 IDR in every future month.
+    """
+    ledger = reconcile_user_ledger("user_25", datastore, extracted_data, converter)
+    future = [
+        e for e in ledger.all_events
+        if e.event_id.startswith("sched_sal_user_25_")
+    ]
+    assert future
+    assert all(e.original_currency == "USD" for e in future)
+    assert all(e.original_amount == Decimal("1800") for e in future)
+    assert all(e.normalized_amount > Decimal("20000000") for e in future)
+
+
 # ---------------------------------------------------------------------------
 # Test 3: Currency Normalization
 # ---------------------------------------------------------------------------

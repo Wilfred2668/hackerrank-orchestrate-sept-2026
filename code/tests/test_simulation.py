@@ -49,6 +49,7 @@ from lib.simulation import (
     find_earliest_date_for_full_payment,
     generate_future_recurring_occurrences,
     generate_future_variable_essential_occurrences,
+    get_conservative_essential_amount,
     get_conservative_recurring_amount,
     get_recurring_cadence_day,
     simulate_cash_flow,
@@ -314,7 +315,6 @@ def test_scenario_3_later_salary_makes_full_payment_safe():
     )
     assert salary_day_safety.is_safe is True
     assert salary_day_safety.minimum_balance == Decimal("3000.00")
-
 
 # ---------------------------------------------------------------------------
 # Test Scenario 4: Exact Binary-Search Boundary Checks
@@ -921,6 +921,52 @@ def test_frequent_unprotected_dining_not_forecast():
     timeline = simulate_cash_flow(ledger, req_date)
     # Daily balances remain 10,000.00 since dining is optional and not protected
     assert timeline.minimum_balance == Decimal("10000.00")
+
+
+def test_isolated_essential_outlier_is_not_repeated_as_weekly_spending():
+    """A one-off bulk purchase cannot inflate every future essential debit."""
+    dates = [date(2026, 1, 2) + timedelta(days=7 * i) for i in range(6)]
+    amounts = [
+        Decimal("90.00"),
+        Decimal("110.00"),
+        Decimal("105.00"),
+        Decimal("115.00"),
+        Decimal("100.00"),
+        Decimal("500.00"),  # isolated bulk stock-up
+    ]
+    events = [
+        _build_test_event(
+            event_id=f"grocery_{index}",
+            event_date=event_date,
+            settlement_date=event_date,
+            direction="debit",
+            amount=amount,
+            category="groceries",
+            description="Grocery purchase",
+        )
+        for index, (event_date, amount) in enumerate(zip(dates, amounts))
+    ]
+
+    assert get_conservative_essential_amount(events) == Decimal("115.00")
+
+
+def test_normal_high_essential_spending_remains_conservative():
+    """A normal high week remains in the forecast when it is not an outlier."""
+    dates = [date(2026, 1, 2) + timedelta(days=7 * i) for i in range(6)]
+    amounts = [
+        Decimal("90.00"), Decimal("110.00"), Decimal("105.00"),
+        Decimal("115.00"), Decimal("100.00"), Decimal("170.00"),
+    ]
+    events = [
+        _build_test_event(
+            event_id=f"grocery_{index}", event_date=event_date,
+            settlement_date=event_date, direction="debit", amount=amount,
+            category="groceries", description="Grocery purchase",
+        )
+        for index, (event_date, amount) in enumerate(zip(dates, amounts))
+    ]
+
+    assert get_conservative_essential_amount(events) == Decimal("170.00")
 
 
 def test_pending_or_scheduled_essential_debit_not_duplicated():
