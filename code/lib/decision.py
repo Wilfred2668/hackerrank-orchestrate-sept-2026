@@ -777,8 +777,14 @@ def evaluate_decision(
     """
     # Step 1: Baseline affordability facts (without spending changes)
     # Living essentials (groceries, transport, dining) are inherently recurring variable
-    # expenses that must be covered in baseline cash-flow safety alongside user-protected categories.
-    safe_essentials = (profile.expense_categories_to_protect or frozenset()) | {"groceries", "transport", "dining"}
+    # expenses, unless the user explicitly declared them flexible (willing to reduce/stop).
+    user_flexible = (profile.expense_categories_user_is_willing_to_reduce or frozenset()) | (
+        profile.expense_categories_user_is_willing_to_stop or frozenset()
+    )
+    safe_essentials = (
+        ((profile.expense_categories_to_protect or frozenset()) | {"groceries", "transport", "dining"})
+        - user_flexible
+    ) | (profile.expense_categories_to_protect or frozenset())
     amount_safe_to_pay = compute_amount_safe_to_pay(
         ledger=ledger,
         request_date=request.request_date,
