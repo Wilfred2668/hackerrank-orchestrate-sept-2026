@@ -7,6 +7,7 @@ Consumes:
   3. Request (or request_date, requested_amount)
 
 Provides:
+  - generate_future_recurring_occurrences: Generates future recurring debits across [request_date, request_date + 90 days]
   - simulate_cash_flow: Generates daily balance timelines over [request_date, request_date + 90 days]
   - evaluate_schedule_safety: Tests whether a proposed payment schedule maintains minimum balance
   - compute_amount_safe_to_pay: Binary search for largest safe one-time payment on request_date
@@ -18,7 +19,8 @@ Strict monetary precision:
 
 from __future__ import annotations
 
-from collections import defaultdict
+import calendar
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import date, timedelta
 from decimal import Decimal, ROUND_FLOOR
@@ -84,6 +86,168 @@ def clean_decimal(val: Decimal) -> Decimal:
 
 
 # ---------------------------------------------------------------------------
+# Recurrence Forecasting & Cadence Helpers
+# ---------------------------------------------------------------------------
+
+def get_recurring_cadence_day(events: Sequence[ReconciledEvent]) -> int:
+    """Determine the cadence day of the month for a recurring stream.
+
+    If the events land on month-end days (28, 29, 30, 31) across different months,
+    returns the maximum day (e.g. 31), so that month-end logic will cap at the
+    last day of each subsequent month (e.g. Feb 28, Apr 30, May 31).
+    Otherwise returns the most frequent day of month.
+    """
+    if not events:
+        return 1
+
+    regular = [
+        e for e in events
+        if not any(k in e.description.lower() for k in (
+            "arrear", "outstanding", "retry", "catch-up", "adjustment", "one-time", "balance", "prorated"
+        ))
+    ]
+    target_events = regular if regular else list(events)
+    days = [e.event_date.day for e in target_events]
+
+    # Check if month-end pattern
+    if max(days) in (28, 29, 30, 31) and min(days) in (28, 29, 30, 31):
+        return max(days)
+
+    return Counter(days).most_common(1)[0][0]
+
+
+def get_conservative_recurring_amount(events: Sequence[ReconciledEvent]) -> Decimal:
+    """Determine the conservative amount for a recurring stream from event history.
+
+    Rule:
+      1. Filter for regular occurrences (excluding one-off arrears, retries, adjustments, etc.).
+      2. Take the most recent supported occurrences (up to the last 6 cycles).
+      3. Return the maximum normalized amount among those occurrences.
+    """
+    if not events:
+        return Decimal("0.00")
+
+    regular = [
+        e for e in events
+        if not any(k in e.description.lower() for k in (
+            "arrear", "outstanding", "retry", "catch-up", "adjustment", "one-time", "balance", "prorated"
+        ))
+    ]
+    target_events = regular if regular else list(events)
+    recent = sorted(target_events, key=lambda x: x.event_date)[-6:]
+    return max(e.normalized_amount for e in recent)
+
+
+def generate_future_recurring_occurrences(
+    ledger: ReconciledLedger,
+    request_date: date,
+    forecast_days: int = 90,
+) -> List[ReconciledEvent]:
+    """Generate future recurring cash events across [request_date, request_date + forecast_days].
+
+    Consumes `ledger.recurring_events` and projects recurring debits (rent, utilities,
+    subscriptions, debt payments, healthcare, education, insurance, etc.) that do not
+    already have scheduled occurrences in `ledger.all_events`.
+
+    De-duplication Key:
+      (category, direction, cadence_year, cadence_month)
+      Preserves any occurrence already present in `ledger.all_events` on or after request_date
+      that falls on candidate_date or within the same monthly cadence cycle (+/- 7 days).
+
+    Salary streams (direction == 'credit' and category == 'salary') are managed by Phase 3's
+    reconciliation synthesis and are never duplicated here.
+
+    Args:
+        ledger: ReconciledLedger containing recurring_events and existing scheduled events.
+        request_date: Start of the simulation horizon.
+        forecast_days: Horizon length in days (default: 90).
+
+    Returns:
+        List of newly projected ReconciledEvent instances with status='scheduled'.
+    """
+    start_date = request_date
+    end_date = request_date + timedelta(days=forecast_days)
+
+    streams: Dict[Tuple[str, str], List[ReconciledEvent]] = defaultdict(list)
+    for e in ledger.recurring_events:
+        streams[(e.category, e.direction)].append(e)
+
+    projected_events: List[ReconciledEvent] = []
+
+    for (cat, direction), stream_events in streams.items():
+        # Phase 3 reconciliation already manages recurring salary synthesis
+        if cat == "salary" and direction == "credit":
+            continue
+
+        cadence_day = get_recurring_cadence_day(stream_events)
+        conservative_amt = get_conservative_recurring_amount(stream_events)
+
+        # Inherit metadata from the latest event in the stream
+        latest_event = max(stream_events, key=lambda x: x.event_date)
+
+        # Generate occurrences through forecast window
+        cur_year = start_date.year
+        cur_month = start_date.month
+
+        while (cur_year, cur_month) <= (end_date.year, end_date.month):
+            max_day = calendar.monthrange(cur_year, cur_month)[1]
+            cand_day = min(cadence_day, max_day)
+            cand_date = date(cur_year, cur_month, cand_day)
+
+            if start_date <= cand_date <= end_date:
+                # De-duplication check:
+                # Does ledger.all_events already contain a scheduled/settled occurrence
+                # for (cat, direction) in this cadence cycle on or after request_date?
+                already_exists = any(
+                    e.category == cat
+                    and e.direction == direction
+                    and (e.settlement_date or e.event_date) >= start_date
+                    and (
+                        (e.settlement_date or e.event_date) == cand_date
+                        or (
+                            (e.settlement_date or e.event_date).year == cand_date.year
+                            and (e.settlement_date or e.event_date).month == cand_date.month
+                            and abs(((e.settlement_date or e.event_date) - cand_date).days) <= 7
+                        )
+                    )
+                    for e in ledger.all_events
+                )
+
+                if not already_exists:
+                    proj_ev = ReconciledEvent(
+                        event_id=f"proj_{cat}_{cand_date.isoformat()}",
+                        user_id=ledger.user_id,
+                        event_type=latest_event.event_type,
+                        description=f"Projected recurring {cat}",
+                        category=cat,
+                        direction=direction,
+                        original_amount=conservative_amt,
+                        original_currency=ledger.home_currency,
+                        normalized_amount=conservative_amt,
+                        home_currency=ledger.home_currency,
+                        event_date=cand_date,
+                        settlement_date=cand_date,
+                        status="scheduled",
+                        flexibility=latest_event.flexibility,
+                        minimum_allowed_amount=latest_event.minimum_allowed_amount,
+                        is_recurring=True,
+                        is_protected=latest_event.is_protected,
+                        is_reducible=latest_event.is_reducible,
+                        is_stoppable=latest_event.is_stoppable,
+                    )
+                    projected_events.append(proj_ev)
+
+            # Advance to next month
+            if cur_month == 12:
+                cur_year += 1
+                cur_month = 1
+            else:
+                cur_month += 1
+
+    return projected_events
+
+
+# ---------------------------------------------------------------------------
 # 1. Daily 90-Day Cash-Flow Simulation
 # ---------------------------------------------------------------------------
 
@@ -94,12 +258,15 @@ def simulate_cash_flow(
     extra_events: Optional[Sequence[ReconciledEvent]] = None,
     excluded_event_ids: Optional[Set[str]] = None,
     forecast_days: int = 90,
+    include_projected_recurring: bool = True,
 ) -> SimulationTimeline:
     """Run a deterministic daily cash-flow simulation over [request_date, request_date + forecast_days].
 
     Rules:
       - Starts at `current_available_balance` on `request_date`.
-      - Applies each reconciled event on its `settlement_date` (or `event_date` if settlement_date is None).
+      - Incorporates conservative projected occurrences for recurring commitments
+        (rent, utilities, subscriptions, debt repayments, etc.).
+      - Applies each event on its `settlement_date` (or `event_date` if settlement_date is None).
       - Credits increase balance; debits decrease balance.
       - Pending debits remain reserved and reduce projected balance on their settlement date.
       - Excluded events (from Phase 3) are already filtered out of ReconciledLedger.
@@ -112,6 +279,7 @@ def simulate_cash_flow(
         extra_events: Optional additional reconciled events to incorporate.
         excluded_event_ids: Optional set of event_ids to exclude (e.g. stopped expenses).
         forecast_days: Length of simulation window in days (default: 90).
+        include_projected_recurring: If True, forecasts future recurring commitments.
 
     Returns:
         SimulationTimeline with daily balances and minimum projected balance.
@@ -119,12 +287,20 @@ def simulate_cash_flow(
     start_date = request_date
     end_date = request_date + timedelta(days=forecast_days)
 
-    # Aggregate daily ledger cash flows
-    daily_net_flow: Dict[date, Decimal] = defaultdict(lambda: Decimal("0.00"))
-
     events_to_process = list(ledger.all_events)
+    if include_projected_recurring:
+        projected = generate_future_recurring_occurrences(
+            ledger=ledger,
+            request_date=request_date,
+            forecast_days=forecast_days,
+        )
+        events_to_process.extend(projected)
+
     if extra_events:
         events_to_process.extend(extra_events)
+
+    # Aggregate daily ledger cash flows
+    daily_net_flow: Dict[date, Decimal] = defaultdict(lambda: Decimal("0.00"))
 
     for event in events_to_process:
         if excluded_event_ids and event.event_id in excluded_event_ids:
@@ -183,6 +359,7 @@ def evaluate_schedule_safety(
     extra_events: Optional[Sequence[ReconciledEvent]] = None,
     excluded_event_ids: Optional[Set[str]] = None,
     forecast_days: int = 90,
+    include_projected_recurring: bool = True,
 ) -> SafetyResult:
     """Determine whether a proposed payment schedule is safe.
 
@@ -198,6 +375,7 @@ def evaluate_schedule_safety(
         extra_events: Optional additional events to incorporate.
         excluded_event_ids: Optional event_ids to exclude.
         forecast_days: Horizon in days (default: 90).
+        include_projected_recurring: If True, forecasts future recurring commitments.
 
     Returns:
         SafetyResult with is_safe, minimum_balance, and first_unsafe_date if unsafe.
@@ -232,6 +410,7 @@ def evaluate_schedule_safety(
         extra_events=extra_events,
         excluded_event_ids=excluded_event_ids,
         forecast_days=forecast_days,
+        include_projected_recurring=include_projected_recurring,
     )
 
     # Check for violations in chronological order
@@ -271,6 +450,7 @@ def compute_amount_safe_to_pay(
     minimum_balance_to_keep: Optional[Decimal] = None,
     step: Decimal = Decimal("0.01"),
     forecast_days: int = 90,
+    include_projected_recurring: bool = True,
 ) -> Decimal:
     """Compute the largest safe one-time payment on request_date using binary search.
 
@@ -287,6 +467,7 @@ def compute_amount_safe_to_pay(
         minimum_balance_to_keep: Balance threshold (defaults to ledger's).
         step: Smallest currency unit for search granularity (default: Decimal("0.01")).
         forecast_days: Horizon in days (default: 90).
+        include_projected_recurring: If True, forecasts future recurring commitments.
 
     Returns:
         The largest safe payment amount as a Decimal.
@@ -306,6 +487,7 @@ def compute_amount_safe_to_pay(
         request_date=request_date,
         payments=None,
         forecast_days=forecast_days,
+        include_projected_recurring=include_projected_recurring,
     )
 
     max_headroom = baseline.minimum_balance - target_min
@@ -328,6 +510,7 @@ def compute_amount_safe_to_pay(
             payments=[(request_date, mid_amount)],
             minimum_balance_to_keep=target_min,
             forecast_days=forecast_days,
+            include_projected_recurring=include_projected_recurring,
         )
         if safety.is_safe:
             best_step = mid
@@ -352,6 +535,7 @@ def find_earliest_date_for_full_payment(
     extra_events: Optional[Sequence[ReconciledEvent]] = None,
     excluded_event_ids: Optional[Set[str]] = None,
     forecast_days: int = 90,
+    include_projected_recurring: bool = True,
 ) -> Optional[date]:
     """Find the earliest date in [request_date, request_date + forecast_days]
     on which one full payment of requested_amount is safe.
@@ -370,6 +554,7 @@ def find_earliest_date_for_full_payment(
         extra_events: Optional additional events.
         excluded_event_ids: Optional event_ids to exclude.
         forecast_days: Horizon in days (default: 90).
+        include_projected_recurring: If True, forecasts future recurring commitments.
 
     Returns:
         Earliest safe payment date, or None.
@@ -385,6 +570,7 @@ def find_earliest_date_for_full_payment(
             extra_events=extra_events,
             excluded_event_ids=excluded_event_ids,
             forecast_days=forecast_days,
+            include_projected_recurring=include_projected_recurring,
         )
         if res.is_safe:
             return candidate_date
