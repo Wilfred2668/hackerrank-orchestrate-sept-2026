@@ -390,6 +390,8 @@ def simulate_cash_flow(
     forecast_days: int = 90,
     include_projected_recurring: bool = True,
     include_projected_essentials: bool = True,
+    stopped_categories: Optional[AbstractSet[str]] = None,
+    reduced_categories: Optional[Dict[str, Decimal]] = None,
 ) -> SimulationTimeline:
     """Run a deterministic daily cash-flow simulation over [request_date, request_date + forecast_days].
 
@@ -415,6 +417,8 @@ def simulate_cash_flow(
         forecast_days: Length of simulation window in days (default: 90).
         include_projected_recurring: If True, forecasts future recurring commitments.
         include_projected_essentials: If True, forecasts future protected variable essentials.
+        stopped_categories: Optional set of debit categories to completely exclude.
+        reduced_categories: Optional dict mapping debit category to capped/reduced amount.
 
     Returns:
         SimulationTimeline with daily balances and minimum projected balance.
@@ -449,6 +453,8 @@ def simulate_cash_flow(
     for event in events_to_process:
         if excluded_event_ids and event.event_id in excluded_event_ids:
             continue
+        if stopped_categories and event.direction == "debit" and event.category in stopped_categories:
+            continue
 
         eff_date = event.settlement_date if event.settlement_date is not None else event.event_date
         # Only events within the forecast window apply during simulation
@@ -456,7 +462,10 @@ def simulate_cash_flow(
             if event.direction == "credit":
                 daily_net_flow[eff_date] += event.normalized_amount
             elif event.direction == "debit":
-                daily_net_flow[eff_date] -= event.normalized_amount
+                amt = event.normalized_amount
+                if reduced_categories and event.category in reduced_categories:
+                    amt = min(amt, reduced_categories[event.category])
+                daily_net_flow[eff_date] -= amt
 
     # Aggregate proposed payments
     if payments:
@@ -506,6 +515,8 @@ def evaluate_schedule_safety(
     forecast_days: int = 90,
     include_projected_recurring: bool = True,
     include_projected_essentials: bool = True,
+    stopped_categories: Optional[AbstractSet[str]] = None,
+    reduced_categories: Optional[Dict[str, Decimal]] = None,
 ) -> SafetyResult:
     """Determine whether a proposed payment schedule is safe.
 
@@ -524,6 +535,8 @@ def evaluate_schedule_safety(
         forecast_days: Horizon in days (default: 90).
         include_projected_recurring: If True, forecasts future recurring commitments.
         include_projected_essentials: If True, forecasts future protected variable essentials.
+        stopped_categories: Optional set of debit categories to completely exclude.
+        reduced_categories: Optional dict mapping debit category to capped/reduced amount.
 
     Returns:
         SafetyResult with is_safe, minimum_balance, and first_unsafe_date if unsafe.
@@ -561,6 +574,8 @@ def evaluate_schedule_safety(
         forecast_days=forecast_days,
         include_projected_recurring=include_projected_recurring,
         include_projected_essentials=include_projected_essentials,
+        stopped_categories=stopped_categories,
+        reduced_categories=reduced_categories,
     )
 
     # Check for violations in chronological order

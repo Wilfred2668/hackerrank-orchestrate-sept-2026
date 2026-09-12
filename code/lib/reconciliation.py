@@ -137,8 +137,8 @@ def is_recurring_event(event: FinancialEvent, user_events: List[FinancialEvent])
             return False
         return True
 
-    # Variable spending / one-off events are not recurring fixed commitments
-    if event.category in ("groceries", "transport", "dining", "shopping", "windfall", "work_expense", "investment"):
+    # Fixed variable spending / one-off events are not recurring commitments
+    if event.flexibility == "fixed" and event.category in ("groceries", "transport", "dining", "shopping", "windfall", "work_expense", "investment"):
         return False
 
     # Check for regular cadence in utility/insurance/education/healthcare/family_support
